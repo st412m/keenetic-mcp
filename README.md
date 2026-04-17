@@ -24,6 +24,7 @@ Tested on: **Keenetic Giga KN-1010**, KeeneticOS 5.0.8, arch `mips`.
 
 ### Diagnostics
 - `get_log` — system log with optional line count limit and text filter
+- `run_ping` — ping a host directly from the router, returns latency and packet loss
 
 ### Management
 - `reboot` — reboot the router
@@ -41,7 +42,7 @@ Tested arch **mipsel** (KN-1010/1011, KN-1810, KN-1910, KN-2310, KN-3810). Shoul
 
 ### Step 1 — Install Entware
 
-Format a USB drive as ext4 and plug it into the router. In the router web interface go to **Applications → OPKG** and make sure the drive is selected as the storage.
+Format a USB drive as ext4 and plug it into the router. In the router web interface go to Applications -> OPKG and make sure the drive is selected as the storage.
 
 Download the installer for your router model and copy it to the `install` folder on the USB drive via SMB (\\192.168.1.1):
 
