@@ -3,7 +3,6 @@
 import json
 import hashlib
 import urllib.request
-import urllib.parse
 import urllib.error
 import http.server
 import os
@@ -109,6 +108,34 @@ TOOLS = {
         "description": "Get WiFi networks and connected stations",
         "inputSchema": {"type": "object", "properties": {}}
     },
+    "get_wifi_stations": {
+        "description": "Get currently associated WiFi stations with signal strength and traffic",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
+    "get_traffic": {
+        "description": "Get traffic summary for all active network interfaces (rx/tx bytes)",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
+    "get_internet_status": {
+        "description": "Get internet connection status and external IP",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
+    "get_site_survey": {
+        "description": "Scan and list nearby WiFi networks",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
+    "block_client": {
+        "description": "Block a registered client by MAC address",
+        "inputSchema": {"type": "object", "properties": {
+            "mac": {"type": "string", "description": "MAC address to block, e.g. aa:bb:cc:dd:ee:ff"}
+        }, "required": ["mac"]}
+    },
+    "unblock_client": {
+        "description": "Unblock a previously blocked client by MAC address",
+        "inputSchema": {"type": "object", "properties": {
+            "mac": {"type": "string", "description": "MAC address to unblock, e.g. aa:bb:cc:dd:ee:ff"}
+        }, "required": ["mac"]}
+    },
     "reboot": {
         "description": "Reboot the router",
         "inputSchema": {"type": "object", "properties": {}}
@@ -153,6 +180,96 @@ def call_tool(name, args):
         result = rci({"show": {"wireless": {}}})
         return json.dumps(result, ensure_ascii=False, indent=2)
 
+    elif name == "get_wifi_stations":
+        result = rci({"show": {"associations": {}}})
+        stations = result.get("show", {}).get("associations", {}).get("station", [])
+        output = []
+        for s in stations:
+            output.append({
+                "mac": s.get("mac"),
+                "ap": s.get("ap"),
+                "rssi": s.get("rssi"),
+                "mode": s.get("mode"),
+                "txrate": s.get("txrate"),
+                "rxrate": s.get("rxrate"),
+                "txbytes": s.get("txbytes"),
+                "rxbytes": s.get("rxbytes"),
+                "uptime": s.get("uptime"),
+                "security": s.get("security")
+            })
+        return json.dumps(output, ensure_ascii=False, indent=2)
+
+    elif name == "get_traffic":
+        result = rci({"show": {"interface": {}}})
+        interfaces = result.get("show", {}).get("interface", {})
+        output = []
+        for iface_name, iface in interfaces.items():
+            if not isinstance(iface, dict):
+                continue
+            if iface.get("state") != "up":
+                continue
+            if iface.get("type") in ["Port", "Vlan"]:
+                continue
+            output.append({
+                "name": iface_name,
+                "description": iface.get("description", ""),
+                "type": iface.get("type"),
+                "address": iface.get("address"),
+                "uptime": iface.get("uptime"),
+                "rx_bytes": iface.get("rxbytes"),
+                "tx_bytes": iface.get("txbytes")
+            })
+        return json.dumps(output, ensure_ascii=False, indent=2)
+
+    elif name == "get_internet_status":
+        result = rci({"show": {"interface": {}}})
+        interfaces = result.get("show", {}).get("interface", {})
+        output = []
+        for iface_name, iface in interfaces.items():
+            if not isinstance(iface, dict):
+                continue
+            if iface.get("global") and iface.get("state") == "up":
+                output.append({
+                    "name": iface_name,
+                    "description": iface.get("description", ""),
+                    "address": iface.get("address"),
+                    "uptime": iface.get("uptime"),
+                    "defaultgw": iface.get("defaultgw", False),
+                    "priority": iface.get("priority")
+                })
+        return json.dumps(output, ensure_ascii=False, indent=2)
+
+    elif name == "get_site_survey":
+        result = rci({"show": {"site-survey": {"name": "WifiMaster0"}}})
+        aps = result.get("show", {}).get("site-survey", {}).get("ap_cell", [])
+        output = []
+        for ap in aps:
+            output.append({
+                "ssid": ap.get("essid"),
+                "mac": ap.get("address"),
+                "channel": ap.get("channel"),
+                "rssi": ap.get("rssi"),
+                "quality": ap.get("quality"),
+                "encryption": ap.get("encryption"),
+                "mode": ap.get("ieee")
+            })
+        output.sort(key=lambda x: x.get("rssi", -999), reverse=True)
+        return json.dumps(output, ensure_ascii=False, indent=2)
+
+    elif name == "block_client":
+        mac = args.get("mac", "").lower().strip()
+        if not mac:
+            return "Error: mac address required"
+        result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "deny"}}}})
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    elif name == "unblock_client":
+        mac = args.get("mac", "").lower().strip()
+        if not mac:
+            return "Error: mac address required"
+        result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "permit"}}}})
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
     elif name == "reboot":
         rci({"system": {"reboot": {}}})
         return "Reboot command sent"
@@ -172,7 +289,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             caps = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "keenetic-mcp", "version": "1.0.0"}
+                "serverInfo": {"name": "keenetic-mcp", "version": "1.1.0"}
             }
             self.wfile.write(json.dumps(caps).encode())
         else:
@@ -196,7 +313,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             response["result"] = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "keenetic-mcp", "version": "1.0.0"}
+                "serverInfo": {"name": "keenetic-mcp", "version": "1.1.0"}
             }
         elif method == "tools/list":
             response["result"] = {"tools": [
