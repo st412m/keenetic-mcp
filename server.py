@@ -6,6 +6,7 @@ import urllib.request
 import urllib.error
 import http.server
 import os
+import subprocess
 
 HOST = "http://192.168.1.1"
 USER = "admin"
@@ -123,6 +124,13 @@ TOOLS = {
     "get_site_survey": {
         "description": "Scan and list nearby WiFi networks",
         "inputSchema": {"type": "object", "properties": {}}
+    },
+    "run_ping": {
+        "description": "Ping a host from the router and return latency and packet loss",
+        "inputSchema": {"type": "object", "properties": {
+            "host": {"type": "string", "description": "Host or IP to ping"},
+            "count": {"type": "integer", "description": "Number of packets (default 4)"}
+        }, "required": ["host"]}
     },
     "block_client": {
         "description": "Block a registered client by MAC address",
@@ -256,6 +264,17 @@ def call_tool(name, args):
         output.sort(key=lambda x: x.get("rssi", -999), reverse=True)
         return json.dumps(output, ensure_ascii=False, indent=2)
 
+    elif name == "run_ping":
+        host = args.get("host", "").strip()
+        if not host:
+            return "Error: host required"
+        count = min(int(args.get("count", 4)), 10)
+        r = subprocess.run(
+            ["ping", "-c", str(count), "-W", "2", host],
+            capture_output=True, text=True, timeout=30
+        )
+        return r.stdout if r.stdout else r.stderr
+
     elif name == "block_client":
         mac = args.get("mac", "").lower().strip()
         if not mac:
@@ -289,7 +308,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             caps = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "keenetic-mcp", "version": "1.1.0"}
+                "serverInfo": {"name": "keenetic-mcp", "version": "1.2.0"}
             }
             self.wfile.write(json.dumps(caps).encode())
         else:
@@ -313,7 +332,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             response["result"] = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "keenetic-mcp", "version": "1.1.0"}
+                "serverInfo": {"name": "keenetic-mcp", "version": "1.2.0"}
             }
         elif method == "tools/list":
             response["result"] = {"tools": [
