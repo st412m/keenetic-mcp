@@ -1,0 +1,21 @@
+#!/bin/sh
+
+case "$1" in
+    start)
+        python3 /opt/keenetic-mcp/server.py > /opt/keenetic-mcp/server.log 2>&1 &
+        echo $! > /opt/keenetic-mcp/server.pid
+        echo "Keenetic MCP started"
+        ;;
+    stop)
+        kill $(cat /opt/keenetic-mcp/server.pid 2>/dev/null) 2>/dev/null
+        echo "Keenetic MCP stopped"
+        ;;
+    restart)
+        $0 stop
+        sleep 1
+        $0 start
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        ;;
+esac
