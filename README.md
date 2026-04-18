@@ -10,10 +10,10 @@ Tested on: **Keenetic Giga KN-1010**, KeeneticOS 5.0.8, arch `mips`.
 - `get_system_info` — firmware version, uptime, CPU load, memory usage
 - `get_internet_status` — internet connection status and external IP address
 - `get_interfaces` — all network interfaces status and configuration
-- `get_traffic` — rx/tx traffic summary for all active interfaces
+- `get_traffic` — top clients by traffic with total rx/tx summary
 
 ### WiFi
-- `get_wifi` — WiFi networks configuration and status
+- `get_wifi` — WiFi radio status: channel, bandwidth, bitrate, temperature, connected stations count
 - `get_wifi_stations` — currently connected WiFi devices with signal strength (RSSI), speed and traffic
 - `get_site_survey` — scan nearby WiFi networks (useful for channel selection)
 
@@ -113,13 +113,20 @@ https://keenetic-mcp.YOUR_DDNS.keenetic.link/YOUR_MCP_SECRET
 
 In Claude.ai go to Settings -> Integrations -> Add custom connector and paste the URL from Step 6.
 
+## Notes
+
+- All 13 tools tested on NDMS 5.0.8
+- get_wifi uses show interface (show wireless endpoint removed in NDMS 5.x)
+- get_traffic aggregates rx/tx from active clients and shows top 10 by usage
+- block_client only works for devices already registered in the router
+- Mesh extender clients are visible in get_clients as part of the main network
+
 ## Security Notes
 
 - The endpoint is protected by a secret token in the URL path
 - HTTPS is handled by Keenetic built-in SSL certificate
 - Never commit .env — it is in .gitignore
 - Change the default SSH password after installation
-- block_client only works for devices already registered in the router
 
 ## License
 
