@@ -188,6 +188,10 @@ TOOLS = {
             "mac": {"type": "string", "description": "MAC address to unblock, e.g. aa:bb:cc:dd:ee:ff"}
         }, "required": ["mac"]}
     },
+    "get_mesh_nodes": {
+        "description": "Get Mesh Wi-Fi system nodes: controller and extenders with client count, firmware, uptime and connection speed",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
     "reboot": {
         "description": "Reboot the router",
         "inputSchema": {"type": "object", "properties": {}}
@@ -555,6 +559,37 @@ def call_tool(name, args):
             return "Error: mac address required"
         result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "permit"}}}})
         return json.dumps(result, ensure_ascii=False, indent=2)
+
+    elif name == "get_mesh_nodes":
+        result = rci({"show": {"ip": {"hotspot": {}}}})
+        hosts = result.get("show", {}).get("ip", {}).get("hotspot", {}).get("host", [])
+        extenders = [h for h in hosts if h.get("system-mode") == "extender"]
+        sys_result = rci({"show": {"version": {}, "system": {}}})
+        version = sys_result.get("show", {}).get("version", {})
+        total_clients = sum(1 for h in hosts if h.get("active") and not h.get("system-mode"))
+        nodes = [{
+            "role": "controller",
+            "name": version.get("description", ""),
+            "model": version.get("hw_id", ""),
+            "firmware": version.get("release", ""),
+            "total_active_clients": total_clients,
+            "connection": "direct",
+            "note": "Client distribution per node not available via RCI in NDMS 5.x"
+        }]
+        for e in extenders:
+            nodes.append({
+                "role": "extender",
+                "name": e.get("name", ""),
+                "model": e.get("description", ""),
+                "firmware": e.get("firmware", ""),
+                "ip": e.get("ip"),
+                "mac": e.get("mac"),
+                "connection_speed_mbps": e.get("speed"),
+                "uptime_sec": e.get("uptime"),
+                "port": e.get("port"),
+                "active": e.get("active")
+            })
+        return json.dumps(nodes, ensure_ascii=False, indent=2)
 
     elif name == "reboot":
         rci({"system": {"reboot": {}}})
