@@ -36,9 +36,6 @@ Tested on: **Keenetic Giga KN-1010**, KeeneticOS 5.0.8, arch `mips`.
 ### Mesh
 - `get_mesh_nodes` — get Mesh Wi-Fi system nodes: controller and extenders with firmware, uptime and connection speed
 
-### Mesh
-- `get_mesh_nodes` — get Mesh Wi-Fi system nodes: controller and extenders with firmware, uptime and connection speed
-
 ### Security
 - `get_web_access` — list of web applications exposed to the internet via Keenetic DDNS
 
