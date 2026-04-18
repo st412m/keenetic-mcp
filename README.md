@@ -11,15 +11,18 @@ Tested on: **Keenetic Giga KN-1010**, KeeneticOS 5.0.8, arch `mips`.
 - `get_internet_status` — internet connection status and external IP address
 - `get_interfaces` — all network interfaces status and configuration
 - `get_traffic` — top clients by traffic with total rx/tx summary
+- `get_vpn_status` — status of all VPN interfaces (WireGuard, IPsec, L2TP, PPTP) with peer details
 
 ### WiFi
 - `get_wifi` — WiFi radio status: channel, bandwidth, bitrate, temperature, connected stations count
 - `get_wifi_stations` — currently connected WiFi devices with signal strength (RSSI), speed and traffic
-- `get_site_survey` — scan nearby WiFi networks (useful for channel selection)
+- `get_site_survey` — scan nearby WiFi networks
+- `get_channel_analysis` — analyze WiFi channel congestion and recommend the least busy channel for 2.4GHz and 5GHz
 
 ### Clients
 - `get_clients` — all devices in the network with IP, MAC, signal, traffic
 - `get_unregistered_clients` — active devices not yet registered in the router (unknown devices)
+- `get_dhcp_leases` — devices with active DHCP leases including expiry time
 - `register_client` — register a device by MAC, assign a name and optionally a static IP
 - `update_client` — update name or static IP of a registered device
 - `block_client` — block a device by MAC address (works for both registered and unregistered devices)
@@ -27,7 +30,11 @@ Tested on: **Keenetic Giga KN-1010**, KeeneticOS 5.0.8, arch `mips`.
 
 ### Diagnostics
 - `get_log` — system log with optional line count limit and text filter
+- `get_log_by_device` — system log filtered by device MAC address, IP address or name
 - `run_ping` — ping a host directly from the router, returns latency and packet loss
+
+### Security
+- `get_web_access` — list of web applications exposed to the internet via Keenetic DDNS
 
 ### Management
 - `reboot` — reboot the router
@@ -119,17 +126,21 @@ In Claude.ai go to Settings -> Integrations -> Add custom connector and paste th
 ## How Client Management Works
 
 - `get_unregistered_clients` shows devices that connected to your network but were never named or registered
-- `register_client` assigns a name and optional static IP to a device — after this it can be blocked
+- `get_dhcp_leases` shows devices that received an IP from DHCP with time until lease expires
+- `register_client` assigns a name and optional static IP to a device
 - `block_client` denies network access to a device. If the device is not yet registered, it will be registered automatically as "Blocked Device" before blocking
-- `unblock_client` restores access with `permit` rule
+- `unblock_client` restores access with permit rule
 - Blocking does not disconnect the device from WiFi — it cuts off internet and LAN access at the firewall level
 
 ## Notes
 
-- All 16 tools tested on NDMS 5.0.8
+- All 21 tools tested on NDMS 5.0.8
 - get_wifi uses show interface (show wireless endpoint removed in NDMS 5.x)
 - get_traffic aggregates rx/tx from active clients and shows top 10 by usage
+- get_channel_analysis uses site survey data to recommend least congested channel
+- get_log_by_device resolves device name/IP to MAC for more accurate log matching
 - Mesh extender clients are visible in get_clients as part of the main network
+- Port forwarding and firewall rules are not available via RCI in NDMS 5.x
 
 ## Security Notes
 

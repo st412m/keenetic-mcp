@@ -99,6 +99,10 @@ TOOLS = {
         "description": "Get list of active but unregistered (unknown) devices in the network",
         "inputSchema": {"type": "object", "properties": {}}
     },
+    "get_dhcp_leases": {
+        "description": "Get list of devices with active DHCP leases including expiry time",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
     "get_interfaces": {
         "description": "Get network interfaces status and traffic stats",
         "inputSchema": {"type": "object", "properties": {}}
@@ -109,6 +113,13 @@ TOOLS = {
             "lines": {"type": "integer", "description": "Number of lines (default 50)"},
             "filter": {"type": "string", "description": "Filter text to search in log lines"}
         }}
+    },
+    "get_log_by_device": {
+        "description": "Get system log entries filtered by device MAC address, IP address or name",
+        "inputSchema": {"type": "object", "properties": {
+            "device": {"type": "string", "description": "MAC address, IP address or device name"},
+            "lines": {"type": "integer", "description": "Number of lines (default 50)"}
+        }, "required": ["device"]}
     },
     "get_wifi": {
         "description": "Get WiFi radio status: channel, bandwidth, bitrate, temperature, connected stations count",
@@ -128,6 +139,18 @@ TOOLS = {
     },
     "get_site_survey": {
         "description": "Scan and list nearby WiFi networks",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
+    "get_channel_analysis": {
+        "description": "Analyze WiFi channel congestion and recommend the least busy channel",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
+    "get_vpn_status": {
+        "description": "Get status of all VPN interfaces (WireGuard, IPsec, L2TP, PPTP)",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
+    "get_web_access": {
+        "description": "Get list of web applications exposed to the internet via Keenetic DDNS",
         "inputSchema": {"type": "object", "properties": {}}
     },
     "run_ping": {
@@ -169,10 +192,6 @@ TOOLS = {
         "description": "Reboot the router",
         "inputSchema": {"type": "object", "properties": {}}
     },
-    "get_web_access": {
-        "description": "Get list of web applications exposed to the internet via Keenetic DDNS (domain name, upstream address)",
-        "inputSchema": {"type": "object", "properties": {}}
-    },
 }
 
 def call_tool(name, args):
@@ -195,13 +214,29 @@ def call_tool(name, args):
                 "ip": h.get("ip"),
                 "hostname": h.get("hostname", ""),
                 "link": h.get("link"),
-                "rssi": h.get("mws", {}).get("rssi") if h.get("mws") else h.get("rssi"),
                 "first_seen": h.get("first-seen"),
                 "last_seen": h.get("last-seen")
             })
         if not output:
             return "No unregistered active devices found"
         return json.dumps(output, ensure_ascii=False, indent=2)
+
+    elif name == "get_dhcp_leases":
+        result = rci({"show": {"ip": {"hotspot": {}}}})
+        hosts = result.get("show", {}).get("ip", {}).get("hotspot", {}).get("host", [])
+        leases = []
+        for h in hosts:
+            expires = h.get("dhcp", {}).get("expires", 0)
+            if expires and expires > 0:
+                leases.append({
+                    "name": h.get("name", h.get("hostname", "")),
+                    "mac": h.get("mac"),
+                    "ip": h.get("ip"),
+                    "expires_sec": expires,
+                    "active": h.get("active", False)
+                })
+        leases.sort(key=lambda x: x["expires_sec"])
+        return json.dumps(leases, ensure_ascii=False, indent=2)
 
     elif name == "get_interfaces":
         result = rci({"show": {"interface": {}}})
@@ -226,6 +261,43 @@ def call_tool(name, args):
                 entries.append(line)
         if filter_text:
             entries = [l for l in entries if filter_text.lower() in l.lower()]
+        return "\n".join(entries[-lines:])
+
+    elif name == "get_log_by_device":
+        device = args.get("device", "").strip().lower()
+        lines = args.get("lines", 50)
+        if not device:
+            return "Error: device required (MAC, IP or name)"
+        # Resolve device to MAC and IP for better matching
+        result = rci({"show": {"ip": {"hotspot": {}}}})
+        hosts = result.get("show", {}).get("ip", {}).get("hotspot", {}).get("host", [])
+        search_terms = {device}
+        for h in hosts:
+            name_val = h.get("name", "").lower()
+            mac = h.get("mac", "").lower()
+            ip = h.get("ip", "").lower()
+            hostname = h.get("hostname", "").lower()
+            if device in (mac, ip, name_val, hostname):
+                search_terms.update([mac, ip, name_val, hostname])
+        search_terms = {t for t in search_terms if t}
+        # Get log
+        log_result = rci({"show": {"log": {}}})
+        log_dict = log_result.get("show", {}).get("log", {}).get("log", {})
+        if not log_dict:
+            log_dict = log_result.get("show", {}).get("log", {})
+        entries = []
+        for k in sorted(log_dict.keys(), key=lambda x: int(x) if x.isdigit() else 0):
+            entry = log_dict[k]
+            if isinstance(entry, dict):
+                msg = entry.get("message", {})
+                if isinstance(msg, dict):
+                    line = f"[{msg.get('label','?')}] {entry.get('source','')} {msg.get('message','')}"
+                else:
+                    line = str(entry)
+                if any(t in line.lower() for t in search_terms if t):
+                    entries.append(line)
+        if not entries:
+            return f"No log entries found for device: {device}"
         return "\n".join(entries[-lines:])
 
     elif name == "get_wifi":
@@ -329,58 +401,86 @@ def call_tool(name, args):
         output.sort(key=lambda x: x.get("rssi", -999), reverse=True)
         return json.dumps(output, ensure_ascii=False, indent=2)
 
-    elif name == "run_ping":
-        host = args.get("host", "").strip()
-        if not host:
-            return "Error: host required"
-        count = min(int(args.get("count", 4)), 10)
-        r = subprocess.run(
-            ["ping", "-c", str(count), "-W", "2", host],
-            capture_output=True, text=True, timeout=30
-        )
-        return r.stdout if r.stdout else r.stderr
+    elif name == "get_channel_analysis":
+        result = rci({"show": {"site-survey": {"name": "WifiMaster0"}}})
+        aps = result.get("show", {}).get("site-survey", {}).get("ap_cell", [])
+        # Count networks per channel
+        channel_count = {}
+        channel_quality = {}
+        for ap in aps:
+            ch = ap.get("channel")
+            if not ch:
+                continue
+            channel_count[ch] = channel_count.get(ch, 0) + 1
+            q = ap.get("quality", 0)
+            channel_quality[ch] = channel_quality.get(ch, 0) + q
+        # 2.4GHz non-overlapping channels
+        channels_24 = [1, 6, 11]
+        # 5GHz common channels
+        channels_5 = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 132, 136, 140, 149, 153, 157, 161]
+        def analyze(channels):
+            result = []
+            for ch in channels:
+                count = channel_count.get(ch, 0)
+                quality = channel_quality.get(ch, 0)
+                result.append({"channel": ch, "networks": count, "total_quality": quality})
+            result.sort(key=lambda x: (x["networks"], x["total_quality"]))
+            return result
+        output = {
+            "2.4GHz": {
+                "recommended": analyze(channels_24)[0]["channel"],
+                "channels": analyze(channels_24)
+            },
+            "5GHz": {
+                "recommended": analyze(channels_5)[0]["channel"] if any(ch in channel_count for ch in channels_5) else 36,
+                "channels": [c for c in analyze(channels_5) if c["networks"] > 0 or c["channel"] in [36, 44, 149, 157]]
+            },
+            "all_detected": [{"channel": k, "networks": v} for k, v in sorted(channel_count.items())]
+        }
+        return json.dumps(output, ensure_ascii=False, indent=2)
 
-    elif name == "register_client":
-        mac = args.get("mac", "").lower().strip()
-        name_val = args.get("name", "").strip()
-        ip_val = args.get("ip", "").strip()
-        if not mac or not name_val:
-            return "Error: mac and name required"
-        payload = {"mac": mac, "name": name_val, "registered": True}
-        if ip_val:
-            payload["ip"] = ip_val
-        result = rci({"ip": {"hotspot": {"host": payload}}})
-        return f"Device {mac} registered as '{name_val}'" + (f" with IP {ip_val}" if ip_val else "")
-
-    elif name == "update_client":
-        mac = args.get("mac", "").lower().strip()
-        if not mac:
-            return "Error: mac required"
-        payload = {"mac": mac}
-        if args.get("name"):
-            payload["name"] = args["name"].strip()
-        if args.get("ip"):
-            payload["ip"] = args["ip"].strip()
-        result = rci({"ip": {"hotspot": {"host": payload}}})
-        return f"Device {mac} updated: " + json.dumps({k: v for k, v in payload.items() if k != "mac"})
-
-    elif name == "block_client":
-        mac = args.get("mac", "").lower().strip()
-        if not mac:
-            return "Error: mac address required"
-        result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "deny"}}}})
-        statuses = result.get("ip", {}).get("hotspot", {}).get("host", {}).get("status", [])
-        if any(s.get("code") == "19007441" for s in statuses):
-            rci({"ip": {"hotspot": {"host": {"mac": mac, "name": "Blocked Device", "registered": True}}}})
-            result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "deny"}}}})
-        return json.dumps(result, ensure_ascii=False, indent=2)
-
-    elif name == "unblock_client":
-        mac = args.get("mac", "").lower().strip()
-        if not mac:
-            return "Error: mac address required"
-        result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "permit"}}}})
-        return json.dumps(result, ensure_ascii=False, indent=2)
+    elif name == "get_vpn_status":
+        result = rci({"show": {"interface": {}}})
+        interfaces = result.get("show", {}).get("interface", {})
+        vpn_types = ["Wireguard", "IPsec", "OpenVPN", "L2tp", "Pptp", "Sstp", "OpenConnect"]
+        output = []
+        for iface_name, iface in interfaces.items():
+            if not isinstance(iface, dict):
+                continue
+            if iface.get("type") not in vpn_types:
+                continue
+            entry = {
+                "name": iface_name,
+                "type": iface.get("type"),
+                "description": iface.get("description", ""),
+                "state": iface.get("state"),
+                "link": iface.get("link"),
+                "address": iface.get("address"),
+                "uptime": iface.get("uptime")
+            }
+            if iface.get("type") == "Wireguard" and iface.get("wireguard"):
+                wg = iface["wireguard"]
+                peers = wg.get("peer", [])
+                entry["wireguard"] = {
+                    "public_key": wg.get("public-key"),
+                    "listen_port": wg.get("listen-port"),
+                    "peers": [
+                        {
+                            "public_key": p.get("public-key"),
+                            "description": p.get("description", ""),
+                            "remote_endpoint": f"{p.get('remote-endpoint-address')}:{p.get('remote-port')}",
+                            "online": p.get("online"),
+                            "rxbytes": p.get("rxbytes"),
+                            "txbytes": p.get("txbytes"),
+                            "last_handshake": p.get("last-handshake")
+                        }
+                        for p in peers
+                    ]
+                }
+            output.append(entry)
+        if not output:
+            return "No VPN interfaces found"
+        return json.dumps(output, ensure_ascii=False, indent=2)
 
     elif name == "get_web_access":
         try:
@@ -403,6 +503,59 @@ def call_tool(name, args):
         except Exception as e:
             return f"Error reading nginx config: {e}"
 
+    elif name == "run_ping":
+        host = args.get("host", "").strip()
+        if not host:
+            return "Error: host required"
+        count = min(int(args.get("count", 4)), 10)
+        r = subprocess.run(
+            ["ping", "-c", str(count), "-W", "2", host],
+            capture_output=True, text=True, timeout=30
+        )
+        return r.stdout if r.stdout else r.stderr
+
+    elif name == "register_client":
+        mac = args.get("mac", "").lower().strip()
+        name_val = args.get("name", "").strip()
+        ip_val = args.get("ip", "").strip()
+        if not mac or not name_val:
+            return "Error: mac and name required"
+        payload = {"mac": mac, "name": name_val, "registered": True}
+        if ip_val:
+            payload["ip"] = ip_val
+        rci({"ip": {"hotspot": {"host": payload}}})
+        return f"Device {mac} registered as '{name_val}'" + (f" with IP {ip_val}" if ip_val else "")
+
+    elif name == "update_client":
+        mac = args.get("mac", "").lower().strip()
+        if not mac:
+            return "Error: mac required"
+        payload = {"mac": mac}
+        if args.get("name"):
+            payload["name"] = args["name"].strip()
+        if args.get("ip"):
+            payload["ip"] = args["ip"].strip()
+        rci({"ip": {"hotspot": {"host": payload}}})
+        return f"Device {mac} updated: " + json.dumps({k: v for k, v in payload.items() if k != "mac"})
+
+    elif name == "block_client":
+        mac = args.get("mac", "").lower().strip()
+        if not mac:
+            return "Error: mac address required"
+        result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "deny"}}}})
+        statuses = result.get("ip", {}).get("hotspot", {}).get("host", {}).get("status", [])
+        if any(s.get("code") == "19007441" for s in statuses):
+            rci({"ip": {"hotspot": {"host": {"mac": mac, "name": "Blocked Device", "registered": True}}}})
+            result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "deny"}}}})
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    elif name == "unblock_client":
+        mac = args.get("mac", "").lower().strip()
+        if not mac:
+            return "Error: mac address required"
+        result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "permit"}}}})
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
     elif name == "reboot":
         rci({"system": {"reboot": {}}})
         return "Reboot command sent"
@@ -422,7 +575,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             caps = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "keenetic-mcp", "version": "1.4.0"}
+                "serverInfo": {"name": "keenetic-mcp", "version": "1.6.0"}
             }
             self.wfile.write(json.dumps(caps).encode())
         else:
@@ -446,7 +599,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             response["result"] = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "keenetic-mcp", "version": "1.4.0"}
+                "serverInfo": {"name": "keenetic-mcp", "version": "1.6.0"}
             }
         elif method == "tools/list":
             response["result"] = {"tools": [
