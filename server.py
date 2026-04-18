@@ -94,6 +94,10 @@ TOOLS = {
         "description": "Get list of connected clients (devices) in the network",
         "inputSchema": {"type": "object", "properties": {}}
     },
+    "get_unregistered_clients": {
+        "description": "Get list of active but unregistered (unknown) devices in the network",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
     "get_interfaces": {
         "description": "Get network interfaces status and traffic stats",
         "inputSchema": {"type": "object", "properties": {}}
@@ -132,6 +136,22 @@ TOOLS = {
             "count": {"type": "integer", "description": "Number of packets (default 4)"}
         }, "required": ["host"]}
     },
+    "register_client": {
+        "description": "Register a device by MAC address, assign a name and optionally a static IP",
+        "inputSchema": {"type": "object", "properties": {
+            "mac": {"type": "string", "description": "MAC address, e.g. aa:bb:cc:dd:ee:ff"},
+            "name": {"type": "string", "description": "Device name"},
+            "ip": {"type": "string", "description": "Optional static IP address, e.g. 192.168.1.100"}
+        }, "required": ["mac", "name"]}
+    },
+    "update_client": {
+        "description": "Update name or static IP of a registered device",
+        "inputSchema": {"type": "object", "properties": {
+            "mac": {"type": "string", "description": "MAC address, e.g. aa:bb:cc:dd:ee:ff"},
+            "name": {"type": "string", "description": "New device name"},
+            "ip": {"type": "string", "description": "New static IP address"}
+        }, "required": ["mac"]}
+    },
     "block_client": {
         "description": "Block a registered client by MAC address",
         "inputSchema": {"type": "object", "properties": {
@@ -158,6 +178,25 @@ def call_tool(name, args):
     elif name == "get_clients":
         result = rci({"show": {"ip": {"hotspot": {}}}})
         return json.dumps(result, ensure_ascii=False, indent=2)
+
+    elif name == "get_unregistered_clients":
+        result = rci({"show": {"ip": {"hotspot": {}}}})
+        hosts = result.get("show", {}).get("ip", {}).get("hotspot", {}).get("host", [])
+        unreg = [h for h in hosts if h.get("active") and not h.get("registered")]
+        output = []
+        for h in unreg:
+            output.append({
+                "mac": h.get("mac"),
+                "ip": h.get("ip"),
+                "hostname": h.get("hostname", ""),
+                "link": h.get("link"),
+                "rssi": h.get("mws", {}).get("rssi") if h.get("mws") else h.get("rssi"),
+                "first_seen": h.get("first-seen"),
+                "last_seen": h.get("last-seen")
+            })
+        if not output:
+            return "No unregistered active devices found"
+        return json.dumps(output, ensure_ascii=False, indent=2)
 
     elif name == "get_interfaces":
         result = rci({"show": {"interface": {}}})
@@ -190,14 +229,14 @@ def call_tool(name, args):
         stations_result = rci({"show": {"associations": {}}})
         stations = stations_result.get("show", {}).get("associations", {}).get("station", [])
         output = []
-        for name_iface, iface in ifaces.items():
+        for iface_name, iface in ifaces.items():
             if not isinstance(iface, dict):
                 continue
             if iface.get("type") != "WifiMaster":
                 continue
-            ap_count = sum(1 for s in stations if s.get("ap", "").startswith(name_iface))
+            ap_count = sum(1 for s in stations if s.get("ap", "").startswith(iface_name))
             output.append({
-                "name": name_iface,
+                "name": iface_name,
                 "state": iface.get("state"),
                 "channel": iface.get("channel"),
                 "bandwidth": iface.get("bandwidth"),
@@ -296,11 +335,39 @@ def call_tool(name, args):
         )
         return r.stdout if r.stdout else r.stderr
 
+    elif name == "register_client":
+        mac = args.get("mac", "").lower().strip()
+        name_val = args.get("name", "").strip()
+        ip_val = args.get("ip", "").strip()
+        if not mac or not name_val:
+            return "Error: mac and name required"
+        payload = {"mac": mac, "name": name_val, "registered": True}
+        if ip_val:
+            payload["ip"] = ip_val
+        result = rci({"ip": {"hotspot": {"host": payload}}})
+        return f"Device {mac} registered as '{name_val}'" + (f" with IP {ip_val}" if ip_val else "")
+
+    elif name == "update_client":
+        mac = args.get("mac", "").lower().strip()
+        if not mac:
+            return "Error: mac required"
+        payload = {"mac": mac}
+        if args.get("name"):
+            payload["name"] = args["name"].strip()
+        if args.get("ip"):
+            payload["ip"] = args["ip"].strip()
+        result = rci({"ip": {"hotspot": {"host": payload}}})
+        return f"Device {mac} updated: " + json.dumps({k: v for k, v in payload.items() if k != "mac"})
+
     elif name == "block_client":
         mac = args.get("mac", "").lower().strip()
         if not mac:
             return "Error: mac address required"
         result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "deny"}}}})
+        statuses = result.get("ip", {}).get("hotspot", {}).get("host", {}).get("status", [])
+        if any(s.get("code") == "19007441" for s in statuses):
+            rci({"ip": {"hotspot": {"host": {"mac": mac, "name": "Blocked Device", "registered": True}}}})
+            result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "deny"}}}})
         return json.dumps(result, ensure_ascii=False, indent=2)
 
     elif name == "unblock_client":
@@ -329,7 +396,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             caps = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "keenetic-mcp", "version": "1.3.0"}
+                "serverInfo": {"name": "keenetic-mcp", "version": "1.4.0"}
             }
             self.wfile.write(json.dumps(caps).encode())
         else:
@@ -353,7 +420,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             response["result"] = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "keenetic-mcp", "version": "1.3.0"}
+                "serverInfo": {"name": "keenetic-mcp", "version": "1.4.0"}
             }
         elif method == "tools/list":
             response["result"] = {"tools": [
