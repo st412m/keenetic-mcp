@@ -19,7 +19,10 @@ Tested on: **Keenetic Giga KN-1010**, KeeneticOS 5.0.8, arch `mips`.
 
 ### Clients
 - `get_clients` — all devices in the network with IP, MAC, signal, traffic
-- `block_client` — block a registered device by MAC address
+- `get_unregistered_clients` — active devices not yet registered in the router (unknown devices)
+- `register_client` — register a device by MAC, assign a name and optionally a static IP
+- `update_client` — update name or static IP of a registered device
+- `block_client` — block a device by MAC address (works for both registered and unregistered devices)
 - `unblock_client` — unblock a previously blocked device by MAC address
 
 ### Diagnostics
@@ -113,12 +116,19 @@ https://keenetic-mcp.YOUR_DDNS.keenetic.link/YOUR_MCP_SECRET
 
 In Claude.ai go to Settings -> Integrations -> Add custom connector and paste the URL from Step 6.
 
+## How Client Management Works
+
+- `get_unregistered_clients` shows devices that connected to your network but were never named or registered
+- `register_client` assigns a name and optional static IP to a device — after this it can be blocked
+- `block_client` denies network access to a device. If the device is not yet registered, it will be registered automatically as "Blocked Device" before blocking
+- `unblock_client` restores access with `permit` rule
+- Blocking does not disconnect the device from WiFi — it cuts off internet and LAN access at the firewall level
+
 ## Notes
 
-- All 13 tools tested on NDMS 5.0.8
+- All 16 tools tested on NDMS 5.0.8
 - get_wifi uses show interface (show wireless endpoint removed in NDMS 5.x)
 - get_traffic aggregates rx/tx from active clients and shows top 10 by usage
-- block_client only works for devices already registered in the router
 - Mesh extender clients are visible in get_clients as part of the main network
 
 ## Security Notes
