@@ -33,6 +33,9 @@ Tested on: **Keenetic Giga KN-1010**, KeeneticOS 5.0.8, arch `mips`.
 - `get_log_by_device` — system log filtered by device MAC address, IP address or name
 - `run_ping` — ping a host directly from the router, returns latency and packet loss
 
+### Mesh
+- `get_mesh_nodes` — get Mesh Wi-Fi system nodes: controller and extenders with firmware, uptime and connection speed
+
 ### Security
 - `get_web_access` — list of web applications exposed to the internet via Keenetic DDNS
 
@@ -134,7 +137,7 @@ In Claude.ai go to Settings -> Integrations -> Add custom connector and paste th
 
 ## Notes
 
-- All 21 tools tested on NDMS 5.0.8
+- All 22 tools tested on NDMS 5.0.8
 - get_wifi uses show interface (show wireless endpoint removed in NDMS 5.x)
 - get_traffic aggregates rx/tx from active clients and shows top 10 by usage
 - get_channel_analysis uses site survey data to recommend least congested channel
