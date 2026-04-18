@@ -7,6 +7,7 @@ import urllib.error
 import http.server
 import os
 import subprocess
+import re
 
 HOST = "http://192.168.1.1"
 USER = "admin"
@@ -166,6 +167,10 @@ TOOLS = {
     },
     "reboot": {
         "description": "Reboot the router",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
+    "get_web_access": {
+        "description": "Get list of web applications exposed to the internet via Keenetic DDNS (domain name, upstream address)",
         "inputSchema": {"type": "object", "properties": {}}
     },
 }
@@ -376,6 +381,27 @@ def call_tool(name, args):
             return "Error: mac address required"
         result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "permit"}}}})
         return json.dumps(result, ensure_ascii=False, indent=2)
+
+    elif name == "get_web_access":
+        try:
+            with open('/tmp/nginx/nginx.conf') as f:
+                lines = f.readlines()
+            servers = []
+            current = {}
+            for line in lines:
+                line = line.strip()
+                if line.startswith('server_name ') and 'keenetic.link' in line:
+                    current['domain'] = line.replace('server_name ', '').rstrip(';')
+                if 'ndm_proxy_upstream' in line and 'set $' in line:
+                    m = re.search(r'"([\d.:]+)"', line)
+                    if m:
+                        current['upstream'] = m.group(1)
+                if current.get('domain') and current.get('upstream'):
+                    servers.append(dict(current))
+                    current = {}
+            return json.dumps(servers, ensure_ascii=False, indent=2)
+        except Exception as e:
+            return f"Error reading nginx config: {e}"
 
     elif name == "reboot":
         rci({"system": {"reboot": {}}})
