@@ -14,6 +14,7 @@ USER = "admin"
 PASS = "password"
 SECRET = "changeme"
 PORT = 9584
+VERSION = "1.7.1"
 
 session_cookie = None
 
@@ -73,7 +74,7 @@ def rci(commands):
             headers={"Content-Type": "application/json", "Cookie": session_cookie or ""},
             method="POST"
         )
-        return urllib.request.urlopen(req)
+        return urllib.request.urlopen(req, timeout=10)
 
     try:
         resp = do_request()
@@ -389,8 +390,13 @@ def call_tool(name, args):
         return json.dumps(output, ensure_ascii=False, indent=2)
 
     elif name == "get_site_survey":
-        result = rci({"show": {"site-survey": {"name": "WifiMaster0"}}})
-        aps = result.get("show", {}).get("site-survey", {}).get("ap_cell", [])
+        aps = []
+        for master in ["WifiMaster0", "WifiMaster1"]:
+            result = rci({"show": {"site-survey": {"name": master}}})
+            cells = result.get("show", {}).get("site-survey", {}).get("ap_cell", [])
+            for ap in cells:
+                if not any(a.get("address") == ap.get("address") for a in aps):
+                    aps.append(ap)
         output = []
         for ap in aps:
             output.append({
@@ -406,8 +412,13 @@ def call_tool(name, args):
         return json.dumps(output, ensure_ascii=False, indent=2)
 
     elif name == "get_channel_analysis":
-        result = rci({"show": {"site-survey": {"name": "WifiMaster0"}}})
-        aps = result.get("show", {}).get("site-survey", {}).get("ap_cell", [])
+        aps = []
+        for master in ["WifiMaster0", "WifiMaster1"]:
+            result = rci({"show": {"site-survey": {"name": master}}})
+            cells = result.get("show", {}).get("site-survey", {}).get("ap_cell", [])
+            for ap in cells:
+                if not any(a.get("address") == ap.get("address") for a in aps):
+                    aps.append(ap)
         # Count networks per channel
         channel_count = {}
         channel_quality = {}
@@ -610,7 +621,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             caps = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "keenetic-mcp", "version": "1.6.0"}
+                "serverInfo": {"name": "keenetic-mcp", "version": VERSION}
             }
             self.wfile.write(json.dumps(caps).encode())
         else:
@@ -634,7 +645,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             response["result"] = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "keenetic-mcp", "version": "1.6.0"}
+                "serverInfo": {"name": "keenetic-mcp", "version": VERSION}
             }
         elif method == "tools/list":
             response["result"] = {"tools": [
