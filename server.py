@@ -106,7 +106,7 @@ TOOLS = {
         }}
     },
     "get_wifi": {
-        "description": "Get WiFi networks and connected stations",
+        "description": "Get WiFi radio status: channel, bandwidth, bitrate, temperature, connected stations count",
         "inputSchema": {"type": "object", "properties": {}}
     },
     "get_wifi_stations": {
@@ -185,8 +185,28 @@ def call_tool(name, args):
         return "\n".join(entries[-lines:])
 
     elif name == "get_wifi":
-        result = rci({"show": {"wireless": {}}})
-        return json.dumps(result, ensure_ascii=False, indent=2)
+        result = rci({"show": {"interface": {}}})
+        ifaces = result.get("show", {}).get("interface", {})
+        stations_result = rci({"show": {"associations": {}}})
+        stations = stations_result.get("show", {}).get("associations", {}).get("station", [])
+        output = []
+        for name_iface, iface in ifaces.items():
+            if not isinstance(iface, dict):
+                continue
+            if iface.get("type") != "WifiMaster":
+                continue
+            ap_count = sum(1 for s in stations if s.get("ap", "").startswith(name_iface))
+            output.append({
+                "name": name_iface,
+                "state": iface.get("state"),
+                "channel": iface.get("channel"),
+                "bandwidth": iface.get("bandwidth"),
+                "bitrate_mbps": round(iface.get("bitrate", 0) / 1000000, 1) if iface.get("bitrate") else None,
+                "temperature_c": iface.get("temperature"),
+                "connected_stations": ap_count,
+                "busy_channels": iface.get("busy-channels", [])
+            })
+        return json.dumps(output, ensure_ascii=False, indent=2)
 
     elif name == "get_wifi_stations":
         result = rci({"show": {"associations": {}}})
@@ -208,25 +228,26 @@ def call_tool(name, args):
         return json.dumps(output, ensure_ascii=False, indent=2)
 
     elif name == "get_traffic":
-        result = rci({"show": {"interface": {}}})
-        interfaces = result.get("show", {}).get("interface", {})
-        output = []
-        for iface_name, iface in interfaces.items():
-            if not isinstance(iface, dict):
-                continue
-            if iface.get("state") != "up":
-                continue
-            if iface.get("type") in ["Port", "Vlan"]:
-                continue
-            output.append({
-                "name": iface_name,
-                "description": iface.get("description", ""),
-                "type": iface.get("type"),
-                "address": iface.get("address"),
-                "uptime": iface.get("uptime"),
-                "rx_bytes": iface.get("rxbytes"),
-                "tx_bytes": iface.get("txbytes")
-            })
+        result = rci({"show": {"ip": {"hotspot": {}}}})
+        hosts = result.get("show", {}).get("ip", {}).get("hotspot", {}).get("host", [])
+        active = [h for h in hosts if h.get("active")]
+        total_rx = sum(h.get("rxbytes", 0) or 0 for h in active)
+        total_tx = sum(h.get("txbytes", 0) or 0 for h in active)
+        top = sorted(active, key=lambda h: (h.get("rxbytes", 0) or 0) + (h.get("txbytes", 0) or 0), reverse=True)[:10]
+        output = {
+            "total_active_clients": len(active),
+            "total_rx_bytes": total_rx,
+            "total_tx_bytes": total_tx,
+            "top_clients": [
+                {
+                    "name": h.get("name", h.get("hostname", h.get("mac"))),
+                    "ip": h.get("ip"),
+                    "rx_bytes": h.get("rxbytes", 0),
+                    "tx_bytes": h.get("txbytes", 0)
+                }
+                for h in top
+            ]
+        }
         return json.dumps(output, ensure_ascii=False, indent=2)
 
     elif name == "get_internet_status":
@@ -308,7 +329,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             caps = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "keenetic-mcp", "version": "1.2.0"}
+                "serverInfo": {"name": "keenetic-mcp", "version": "1.3.0"}
             }
             self.wfile.write(json.dumps(caps).encode())
         else:
@@ -332,7 +353,7 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             response["result"] = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "keenetic-mcp", "version": "1.2.0"}
+                "serverInfo": {"name": "keenetic-mcp", "version": "1.3.0"}
             }
         elif method == "tools/list":
             response["result"] = {"tools": [
