@@ -61,7 +61,7 @@ def auth():
             return True
     return False
 
-def rci(commands):
+def rci(commands, timeout=10):
     global session_cookie
     if not session_cookie:
         auth()
@@ -74,7 +74,7 @@ def rci(commands):
             headers={"Content-Type": "application/json", "Cookie": session_cookie or ""},
             method="POST"
         )
-        return urllib.request.urlopen(req, timeout=10)
+        return urllib.request.urlopen(req, timeout=timeout)
 
     try:
         resp = do_request()
@@ -250,7 +250,7 @@ def call_tool(name, args):
     elif name == "get_log":
         lines = args.get("lines", 50)
         filter_text = args.get("filter", "")
-        result = rci({"show": {"log": {}}})
+        result = rci({"show": {"log": {}}}, timeout=30)
         log_dict = result.get("show", {}).get("log", {}).get("log", {})
         if not log_dict:
             log_dict = result.get("show", {}).get("log", {})
@@ -286,7 +286,7 @@ def call_tool(name, args):
                 search_terms.update([mac, ip, name_val, hostname])
         search_terms = {t for t in search_terms if t}
         # Get log
-        log_result = rci({"show": {"log": {}}})
+        log_result = rci({"show": {"log": {}}}, timeout=30)
         log_dict = log_result.get("show", {}).get("log", {}).get("log", {})
         if not log_dict:
             log_dict = log_result.get("show", {}).get("log", {})
