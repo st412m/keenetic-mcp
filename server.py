@@ -8,18 +8,35 @@ import http.server
 import os
 import subprocess
 import re
+import threading
+import time
+from datetime import datetime
 
 HOST = "http://192.168.1.1"
 USER = "admin"
 PASS = "password"
 SECRET = "changeme"
 PORT = 9584
-VERSION = "1.7.1"
+VERSION = "1.8.0"
+
+# Backup config
+BACKUP_ENABLED = False
+BACKUP_SCHEDULE = "0 11 * * 0"   # cron expression
+BACKUP_PATH = "/tmp/keenetic-backup"
+BACKUP_KEEP = 0                   # 0 = don't store locally
+BACKUP_RSYNC_HOST = ""
+BACKUP_RSYNC_USER = ""
+BACKUP_RSYNC_KEY = ""
+BACKUP_RSYNC_PATH = ""
 
 session_cookie = None
 
+
 def load_env():
     global HOST, USER, PASS, SECRET, PORT
+    global BACKUP_ENABLED, BACKUP_SCHEDULE, BACKUP_PATH, BACKUP_KEEP
+    global BACKUP_RSYNC_HOST, BACKUP_RSYNC_USER, BACKUP_RSYNC_KEY, BACKUP_RSYNC_PATH
+
     env_file = os.path.join(os.path.dirname(__file__), ".env")
     if os.path.exists(env_file):
         with open(env_file) as f:
@@ -28,11 +45,187 @@ def load_env():
                 if line and not line.startswith("#") and "=" in line:
                     k, v = line.split("=", 1)
                     os.environ[k.strip()] = v.strip()
+
     HOST = os.environ.get("KEENETIC_HOST", HOST)
     USER = os.environ.get("KEENETIC_USER", USER)
     PASS = os.environ.get("KEENETIC_PASS", PASS)
     SECRET = os.environ.get("MCP_SECRET", SECRET)
     PORT = int(os.environ.get("MCP_PORT", str(PORT)))
+
+    BACKUP_ENABLED = os.environ.get("BACKUP_ENABLED", "false").lower() == "true"
+    BACKUP_SCHEDULE = os.environ.get("BACKUP_SCHEDULE", BACKUP_SCHEDULE)
+    BACKUP_PATH = os.environ.get("BACKUP_PATH", BACKUP_PATH)
+    BACKUP_KEEP = int(os.environ.get("BACKUP_KEEP", str(BACKUP_KEEP)))
+    BACKUP_RSYNC_HOST = os.environ.get("BACKUP_RSYNC_HOST", "")
+    BACKUP_RSYNC_USER = os.environ.get("BACKUP_RSYNC_USER", "")
+    BACKUP_RSYNC_KEY = os.environ.get("BACKUP_RSYNC_KEY", "")
+    BACKUP_RSYNC_PATH = os.environ.get("BACKUP_RSYNC_PATH", "")
+
+
+def syslog(message):
+    """Log to router syslog via logger command (no flash writes)."""
+    try:
+        subprocess.run(["logger", "-t", "keenetic-mcp", message],
+                       capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+
+def cron_matches(schedule, now):
+    """Check if cron expression matches current datetime.
+    Format: minute hour day_of_month month day_of_week
+    Supports: * and comma-separated values.
+    """
+    try:
+        parts = schedule.strip().split()
+        if len(parts) != 5:
+            return False
+        minute, hour, dom, month, dow = parts
+
+        def match_field(field, value):
+            if field == "*":
+                return True
+            for part in field.split(","):
+                part = part.strip()
+                if "-" in part:
+                    lo, hi = part.split("-")
+                    if int(lo) <= value <= int(hi):
+                        return True
+                elif int(part) == value:
+                    return True
+            return False
+
+        return (
+            match_field(minute, now.minute) and
+            match_field(hour, now.hour) and
+            match_field(dom, now.day) and
+            match_field(month, now.month) and
+            match_field(dow, now.weekday() + 1 if now.weekday() < 6 else 0)
+        )
+    except Exception:
+        return False
+
+
+def do_backup():
+    """Fetch running-config from router and optionally rsync to remote host."""
+    syslog("INFO: starting config backup")
+
+    # Auth and fetch config
+    try:
+        config_data = fetch_running_config()
+    except Exception as e:
+        syslog(f"ERROR: failed to fetch config: {e}")
+        return False
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    filename = f"keenetic-config-{date_str}.json"
+
+    # Decide storage strategy
+    use_rsync = bool(BACKUP_RSYNC_HOST and BACKUP_RSYNC_USER and BACKUP_RSYNC_PATH)
+
+    if use_rsync:
+        # Write to /tmp (RAM), rsync, then clean up
+        tmp_path = f"/tmp/{filename}"
+        try:
+            with open(tmp_path, "w") as f:
+                f.write(config_data)
+        except Exception as e:
+            syslog(f"ERROR: failed to write tmp file: {e}")
+            return False
+
+        success = rsync_to_remote(tmp_path, filename)
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+        return success
+    else:
+        # Store locally with rotation
+        os.makedirs(BACKUP_PATH, exist_ok=True)
+        local_path = os.path.join(BACKUP_PATH, filename)
+        try:
+            with open(local_path, "w") as f:
+                f.write(config_data)
+        except Exception as e:
+            syslog(f"ERROR: failed to write local backup: {e}")
+            return False
+
+        # Rotate: keep only BACKUP_KEEP newest files
+        if BACKUP_KEEP > 0:
+            try:
+                files = sorted(
+                    [f for f in os.listdir(BACKUP_PATH) if f.startswith("keenetic-config-")],
+                    reverse=True
+                )
+                for old in files[BACKUP_KEEP:]:
+                    os.remove(os.path.join(BACKUP_PATH, old))
+            except Exception as e:
+                syslog(f"WARNING: rotation failed: {e}")
+
+        size = len(config_data)
+        syslog(f"INFO: backup saved locally {local_path} ({size} bytes)")
+        return True
+
+
+def fetch_running_config():
+    """Authenticate and fetch running-config via RCI API."""
+    global session_cookie
+    auth()
+    req = urllib.request.Request(
+        f"{HOST}/rci/show/running-config",
+        headers={"Cookie": session_cookie or ""},
+        method="GET"
+    )
+    resp = urllib.request.urlopen(req, timeout=15)
+    data = resp.read().decode()
+    if not data or len(data) < 100:
+        raise ValueError(f"Config response too short: {len(data)} bytes")
+    return data
+
+
+def rsync_to_remote(local_file, filename):
+    """Rsync a file to remote host via SSH key."""
+    # Check rsync is available
+    if subprocess.run(["which", "rsync"], capture_output=True).returncode != 0:
+        syslog("ERROR: rsync not found, install it: opkg install rsync")
+        return False
+
+    remote = f"{BACKUP_RSYNC_USER}@{BACKUP_RSYNC_HOST}:{BACKUP_RSYNC_PATH}/{filename}"
+    cmd = ["rsync", "-a"]
+    if BACKUP_RSYNC_KEY:
+        cmd += ["-e", f"ssh -i {BACKUP_RSYNC_KEY} -o StrictHostKeyChecking=no"]
+    cmd += [local_file, remote]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if result.returncode == 0:
+        syslog(f"INFO: backup synced to {BACKUP_RSYNC_HOST}:{BACKUP_RSYNC_PATH}/{filename}")
+        return True
+    else:
+        syslog(f"ERROR: rsync failed: {result.stderr.strip()}")
+        return False
+
+
+def backup_scheduler():
+    """Background thread: check schedule every minute, run backup when matched.
+    Waits 60s at start to let the router fully boot before first check.
+    """
+    syslog("INFO: backup scheduler started")
+    time.sleep(60)
+    last_triggered = None
+
+    while True:
+        try:
+            now = datetime.now()
+            # Key: (date, hour, minute) — prevents double-trigger within same minute
+            trigger_key = (now.date(), now.hour, now.minute)
+            if cron_matches(BACKUP_SCHEDULE, now) and last_triggered != trigger_key:
+                last_triggered = trigger_key
+                syslog(f"INFO: backup triggered by schedule '{BACKUP_SCHEDULE}'")
+                threading.Thread(target=do_backup, daemon=True).start()
+        except Exception as e:
+            syslog(f"ERROR: scheduler error: {e}")
+        time.sleep(60)
+
 
 def auth():
     global session_cookie
@@ -61,6 +254,7 @@ def auth():
             return True
     return False
 
+
 def rci(commands, timeout=10):
     global session_cookie
     if not session_cookie:
@@ -86,6 +280,7 @@ def rci(commands, timeout=10):
             resp = do_request()
             return json.loads(resp.read())
         raise
+
 
 TOOLS = {
     "get_system_info": {
@@ -197,7 +392,12 @@ TOOLS = {
         "description": "Reboot the router",
         "inputSchema": {"type": "object", "properties": {}}
     },
+    "backup_config": {
+        "description": "Manually trigger a router config backup right now",
+        "inputSchema": {"type": "object", "properties": {}}
+    },
 }
+
 
 def call_tool(name, args):
     if name == "get_system_info":
@@ -273,7 +473,6 @@ def call_tool(name, args):
         lines = args.get("lines", 50)
         if not device:
             return "Error: device required (MAC, IP or name)"
-        # Resolve device to MAC and IP for better matching
         result = rci({"show": {"ip": {"hotspot": {}}}})
         hosts = result.get("show", {}).get("ip", {}).get("hotspot", {}).get("host", [])
         search_terms = {device}
@@ -285,7 +484,6 @@ def call_tool(name, args):
             if device in (mac, ip, name_val, hostname):
                 search_terms.update([mac, ip, name_val, hostname])
         search_terms = {t for t in search_terms if t}
-        # Get log
         log_result = rci({"show": {"log": {}}}, timeout=30)
         log_dict = log_result.get("show", {}).get("log", {}).get("log", {})
         if not log_dict:
@@ -419,7 +617,6 @@ def call_tool(name, args):
             for ap in cells:
                 if not any(a.get("address") == ap.get("address") for a in aps):
                     aps.append(ap)
-        # Count networks per channel
         channel_count = {}
         channel_quality = {}
         for ap in aps:
@@ -429,10 +626,9 @@ def call_tool(name, args):
             channel_count[ch] = channel_count.get(ch, 0) + 1
             q = ap.get("quality", 0)
             channel_quality[ch] = channel_quality.get(ch, 0) + q
-        # 2.4GHz non-overlapping channels
         channels_24 = [1, 6, 11]
-        # 5GHz common channels
         channels_5 = [36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 132, 136, 140, 149, 153, 157, 161]
+
         def analyze(channels):
             result = []
             for ch in channels:
@@ -441,6 +637,7 @@ def call_tool(name, args):
                 result.append({"channel": ch, "networks": count, "total_quality": quality})
             result.sort(key=lambda x: (x["networks"], x["total_quality"]))
             return result
+
         output = {
             "2.4GHz": {
                 "recommended": analyze(channels_24)[0]["channel"],
@@ -606,6 +803,13 @@ def call_tool(name, args):
         rci({"system": {"reboot": {}}})
         return "Reboot command sent"
 
+    elif name == "backup_config":
+        if not BACKUP_ENABLED:
+            return "Backup is disabled. Set BACKUP_ENABLED=true in .env to enable."
+        threading.Thread(target=do_backup, daemon=True).start()
+        dest = f"{BACKUP_RSYNC_USER}@{BACKUP_RSYNC_HOST}:{BACKUP_RSYNC_PATH}" if BACKUP_RSYNC_HOST else BACKUP_PATH
+        return f"Backup started. Config will be saved to: {dest}"
+
     return f"Unknown tool: {name}"
 
 
@@ -671,8 +875,15 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     load_env()
-    print(f"Starting Keenetic MCP on port {PORT}")
-    print(f"Endpoint: http://0.0.0.0:{PORT}/{SECRET}")
     auth()
+
+    if BACKUP_ENABLED:
+        syslog(f"INFO: backup enabled, schedule='{BACKUP_SCHEDULE}'")
+        t = threading.Thread(target=backup_scheduler, daemon=True)
+        t.start()
+    else:
+        syslog("INFO: backup disabled (BACKUP_ENABLED=false)")
+
+    print(f"Starting Keenetic MCP v{VERSION} on port {PORT}")
     server = http.server.HTTPServer(("0.0.0.0", PORT), MCPHandler)
     server.serve_forever()
