@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for Keenetic routers. Runs directly on the router via Entware. Allows Claude AI to monitor and manage your router.
 
-Tested on: **Keenetic Giga KN-1010**, KeeneticOS 5.0.8, arch `mips`.
+Tested on: **Keenetic Giga KN-1010**, KeeneticOS 5.0.11, arch `mipsel`.
 
 ## Available Tools
 
@@ -41,6 +41,46 @@ Tested on: **Keenetic Giga KN-1010**, KeeneticOS 5.0.8, arch `mips`.
 
 ### Management
 - `reboot` — reboot the router
+- `backup_config` — manually trigger a router config backup right now
+
+## Config Backup
+
+The server includes a built-in scheduler that automatically backs up the router configuration (`running-config`) via the RCI API.
+
+**How it works:**
+- A background thread checks the schedule every minute (no cron required)
+- Config is fetched via authenticated RCI API call
+- If `BACKUP_RSYNC_HOST` is set: config is written to `/tmp` (RAM) and synced to the remote host via rsync over SSH — the flash drive is never written to
+- If no rsync host is set: config is saved locally in `BACKUP_PATH` with rotation
+
+**To enable**, add to your `.env`:
+
+```
+BACKUP_ENABLED=true
+BACKUP_SCHEDULE=0 11 * * 0
+BACKUP_RSYNC_HOST=192.168.1.2
+BACKUP_RSYNC_USER=admin
+BACKUP_RSYNC_KEY=/opt/etc/keenetic-backup-rsa
+BACKUP_RSYNC_PATH=/share/backups/keenetic
+```
+
+**Schedule format** is standard cron: `minute hour day month weekday`
+
+```
+0 11 * * 0   — every Sunday at 11:00
+0 3  * * *   — every day at 03:00
+0 */6 * * *  — every 6 hours
+```
+
+**If using rsync**, install it first and set up SSH key authentication:
+
+```bash
+opkg install rsync
+ssh-keygen -t rsa -f /opt/etc/keenetic-backup-rsa
+cat /opt/etc/keenetic-backup-rsa.pub | ssh user@nas-host "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"
+```
+
+You can also trigger a backup manually at any time via the `backup_config` MCP tool.
 
 ## Requirements
 
@@ -91,7 +131,7 @@ Default password: keenetic. Change it immediately:
     cp .env.example .env
     nano .env
 
-Fill in your credentials in .env:
+Fill in your credentials in `.env`:
 
     KEENETIC_HOST=http://192.168.1.1
     KEENETIC_USER=admin
@@ -137,19 +177,21 @@ In Claude.ai go to Settings -> Integrations -> Add custom connector and paste th
 
 ## Notes
 
-- All 22 tools tested on NDMS 5.0.8
-- get_wifi uses show interface (show wireless endpoint removed in NDMS 5.x)
-- get_traffic aggregates rx/tx from active clients and shows top 10 by usage
-- get_channel_analysis uses site survey data to recommend least congested channel
-- get_log_by_device resolves device name/IP to MAC for more accurate log matching
-- Mesh extender clients are visible in get_clients as part of the main network
+- All 23 tools tested on NDMS 5.0.11
+- `get_wifi` uses `show interface` (`show wireless` endpoint removed in NDMS 5.x)
+- `get_traffic` aggregates rx/tx from active clients and shows top 10 by usage
+- `get_channel_analysis` uses site survey data to recommend least congested channel
+- `get_log_by_device` resolves device name/IP to MAC for more accurate log matching
+- Mesh extender clients are visible in `get_clients` as part of the main network
 - Port forwarding and firewall rules are not available via RCI in NDMS 5.x
+- Backup scheduler runs in a background thread — no cron or external tools needed
+- PID file is stored in `/tmp` (RAM), server output goes to `/dev/null` — no flash writes on startup
 
 ## Security Notes
 
 - The endpoint is protected by a secret token in the URL path
 - HTTPS is handled by Keenetic built-in SSL certificate
-- Never commit .env — it is in .gitignore
+- Never commit `.env` — it is in `.gitignore`
 - Change the default SSH password after installation
 
 ## License
