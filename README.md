@@ -15,12 +15,12 @@ Tested on: **Keenetic Giga KN-1010**, KeeneticOS 5.0.11, arch `mipsel`.
 
 ### WiFi
 - `get_wifi` — WiFi radio status: channel, bandwidth, bitrate, temperature, connected stations count
-- `get_wifi_stations` — currently connected WiFi devices with signal strength (RSSI), speed and traffic
+- `get_wifi_stations` — currently connected WiFi stations with signal strength (RSSI), speed, traffic and mesh node (controller/extender)
 - `get_site_survey` — scan nearby WiFi networks
 - `get_channel_analysis` — analyze WiFi channel congestion and recommend the least busy channel for 2.4GHz and 5GHz
 
 ### Clients
-- `get_clients` — all devices in the network with IP, MAC, signal, traffic
+- `get_clients` — all devices in the network with IP, MAC, signal, traffic and mesh node (controller/extender)
 - `get_unregistered_clients` — active devices not yet registered in the router (unknown devices)
 - `get_dhcp_leases` — devices with active DHCP leases including expiry time
 - `register_client` — register a device by MAC, assign a name and optionally a static IP
@@ -29,7 +29,7 @@ Tested on: **Keenetic Giga KN-1010**, KeeneticOS 5.0.11, arch `mipsel`.
 - `unblock_client` — unblock a previously blocked device by MAC address
 
 ### Diagnostics
-- `get_log` — system log with optional line count limit and text filter
+- `get_log` — system log with timestamps, optional line count limit and text filter
 - `get_log_by_device` — system log filtered by device MAC address, IP address or name
 - `run_ping` — ping a host directly from the router, returns latency and packet loss
 
@@ -182,7 +182,7 @@ In Claude.ai go to Settings -> Integrations -> Add custom connector and paste th
 - `get_traffic` aggregates rx/tx from active clients and shows top 10 by usage
 - `get_channel_analysis` uses site survey data to recommend least congested channel
 - `get_log_by_device` resolves device name/IP to MAC for more accurate log matching
-- Mesh extender clients are visible in `get_clients` as part of the main network
+- Mesh extender clients are fully visible in `get_clients` and `get_wifi_stations` — each device includes a `node` field (`controller` or `extender`) indicating which mesh node it is connected to
 - Port forwarding and firewall rules are not available via RCI in NDMS 5.x
 - Backup scheduler runs in a background thread — no cron or external tools needed
 - PID file is stored in `/tmp` (RAM), server output goes to `/dev/null` — no flash writes on startup
