@@ -289,6 +289,7 @@ def _format_log_line(entry):
     """Format a log entry dict into a readable string with timestamp."""
     if not isinstance(entry, dict):
         return str(entry)
+    return json.dumps(entry)  # TEMP DEBUG
     msg = entry.get("message", {})
     time_str = entry.get("timestamp", "")
     source = entry.get("source", "")
