@@ -17,7 +17,7 @@ USER = "admin"
 PASS = "password"
 SECRET = "changeme"
 PORT = 9584
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 
 # Backup config
 BACKUP_ENABLED = False
@@ -110,7 +110,6 @@ def do_backup():
     """Fetch running-config from router and optionally rsync to remote host."""
     syslog("INFO: starting config backup")
 
-    # Auth and fetch config
     try:
         config_data = fetch_running_config()
     except Exception as e:
@@ -120,11 +119,9 @@ def do_backup():
     date_str = datetime.now().strftime("%Y-%m-%d")
     filename = f"keenetic-config-{date_str}.json"
 
-    # Decide storage strategy
     use_rsync = bool(BACKUP_RSYNC_HOST and BACKUP_RSYNC_USER and BACKUP_RSYNC_PATH)
 
     if use_rsync:
-        # Write to /tmp (RAM), rsync, then clean up
         tmp_path = f"/tmp/{filename}"
         try:
             with open(tmp_path, "w") as f:
@@ -140,7 +137,6 @@ def do_backup():
             pass
         return success
     else:
-        # Store locally with rotation
         os.makedirs(BACKUP_PATH, exist_ok=True)
         local_path = os.path.join(BACKUP_PATH, filename)
         try:
@@ -150,7 +146,6 @@ def do_backup():
             syslog(f"ERROR: failed to write local backup: {e}")
             return False
 
-        # Rotate: keep only BACKUP_KEEP newest files
         if BACKUP_KEEP > 0:
             try:
                 files = sorted(
@@ -185,7 +180,6 @@ def fetch_running_config():
 
 def rsync_to_remote(local_file, filename):
     """Rsync a file to remote host via SSH key."""
-    # Check rsync is available
     if subprocess.run(["which", "rsync"], capture_output=True).returncode != 0:
         syslog("ERROR: rsync not found, install it: opkg install rsync")
         return False
@@ -206,9 +200,7 @@ def rsync_to_remote(local_file, filename):
 
 
 def backup_scheduler():
-    """Background thread: check schedule every minute, run backup when matched.
-    Waits 60s at start to let the router fully boot before first check.
-    """
+    """Background thread: check schedule every minute, run backup when matched."""
     syslog("INFO: backup scheduler started")
     time.sleep(60)
     last_triggered = None
@@ -216,7 +208,6 @@ def backup_scheduler():
     while True:
         try:
             now = datetime.now()
-            # Key: (date, hour, minute) — prevents double-trigger within same minute
             trigger_key = (now.date(), now.hour, now.minute)
             if cron_matches(BACKUP_SCHEDULE, now) and last_triggered != trigger_key:
                 last_triggered = trigger_key
@@ -282,13 +273,47 @@ def rci(commands, timeout=10):
         raise
 
 
+def _get_ap(host):
+    """Extract AP interface from host entry (direct or via MWS backhaul)."""
+    if host.get("mws-backhaul"):
+        return host.get("mws", {}).get("ap", "")
+    return host.get("ap", "")
+
+
+def _get_node(host):
+    """Return 'extender' if client is on extender (mws-backhaul), else 'controller'."""
+    return "extender" if host.get("mws-backhaul") else "controller"
+
+
+def _format_log_line(entry):
+    """Format a log entry dict into a readable string with timestamp."""
+    if not isinstance(entry, dict):
+        return str(entry)
+    msg = entry.get("message", {})
+    time_str = entry.get("time", "")
+    source = entry.get("source", "")
+    if isinstance(msg, dict):
+        label = msg.get("label", "?")
+        text = msg.get("message", "")
+    else:
+        label = "?"
+        text = str(msg)
+    parts = [f"[{label}]"]
+    if time_str:
+        parts.append(time_str)
+    if source:
+        parts.append(source)
+    parts.append(text)
+    return " ".join(parts)
+
+
 TOOLS = {
     "get_system_info": {
         "description": "Get router system info: version, uptime, CPU, memory",
         "inputSchema": {"type": "object", "properties": {}}
     },
     "get_clients": {
-        "description": "Get list of connected clients (devices) in the network",
+        "description": "Get list of connected clients (devices) in the network. Each client includes a 'node' field (controller/extender) indicating which mesh node it is connected to.",
         "inputSchema": {"type": "object", "properties": {}}
     },
     "get_unregistered_clients": {
@@ -304,7 +329,7 @@ TOOLS = {
         "inputSchema": {"type": "object", "properties": {}}
     },
     "get_log": {
-        "description": "Get system log entries",
+        "description": "Get system log entries with timestamps",
         "inputSchema": {"type": "object", "properties": {
             "lines": {"type": "integer", "description": "Number of lines (default 50)"},
             "filter": {"type": "string", "description": "Filter text to search in log lines"}
@@ -322,7 +347,7 @@ TOOLS = {
         "inputSchema": {"type": "object", "properties": {}}
     },
     "get_wifi_stations": {
-        "description": "Get currently associated WiFi stations with signal strength and traffic",
+        "description": "Get currently associated WiFi stations with signal strength, traffic, device name and mesh node (controller/extender)",
         "inputSchema": {"type": "object", "properties": {}}
     },
     "get_traffic": {
@@ -406,7 +431,31 @@ def call_tool(name, args):
 
     elif name == "get_clients":
         result = rci({"show": {"ip": {"hotspot": {}}}})
-        return json.dumps(result, ensure_ascii=False, indent=2)
+        hosts = result.get("show", {}).get("ip", {}).get("hotspot", {}).get("host", [])
+        output = []
+        for h in hosts:
+            ap = _get_ap(h)
+            entry = {
+                "name": h.get("name", h.get("hostname", "")),
+                "mac": h.get("mac"),
+                "ip": h.get("ip"),
+                "hostname": h.get("hostname", ""),
+                "active": h.get("active", False),
+                "node": _get_node(h),
+                "ap": ap,
+                "link": h.get("link"),
+                "uptime": h.get("uptime"),
+                "rxbytes": h.get("rxbytes", 0),
+                "txbytes": h.get("txbytes", 0),
+                "rssi": h.get("rssi") or h.get("mws", {}).get("rssi"),
+                "registered": h.get("registered", False),
+                "access": h.get("access"),
+            }
+            if h.get("port"):
+                entry["port"] = h.get("port")
+                entry["speed"] = h.get("speed")
+            output.append(entry)
+        return json.dumps(output, ensure_ascii=False, indent=2)
 
     elif name == "get_unregistered_clients":
         result = rci({"show": {"ip": {"hotspot": {}}}})
@@ -418,6 +467,7 @@ def call_tool(name, args):
                 "mac": h.get("mac"),
                 "ip": h.get("ip"),
                 "hostname": h.get("hostname", ""),
+                "node": _get_node(h),
                 "link": h.get("link"),
                 "first_seen": h.get("first-seen"),
                 "last_seen": h.get("last-seen")
@@ -457,13 +507,8 @@ def call_tool(name, args):
         entries = []
         for k in sorted(log_dict.keys(), key=lambda x: int(x) if x.isdigit() else 0):
             entry = log_dict[k]
-            if isinstance(entry, dict):
-                msg = entry.get("message", {})
-                if isinstance(msg, dict):
-                    line = f"[{msg.get('label','?')}] {entry.get('source','')} {msg.get('message','')}"
-                else:
-                    line = str(entry)
-                entries.append(line)
+            line = _format_log_line(entry)
+            entries.append(line)
         if filter_text:
             entries = [l for l in entries if filter_text.lower() in l.lower()]
         return "\n".join(entries[-lines:])
@@ -491,14 +536,9 @@ def call_tool(name, args):
         entries = []
         for k in sorted(log_dict.keys(), key=lambda x: int(x) if x.isdigit() else 0):
             entry = log_dict[k]
-            if isinstance(entry, dict):
-                msg = entry.get("message", {})
-                if isinstance(msg, dict):
-                    line = f"[{msg.get('label','?')}] {entry.get('source','')} {msg.get('message','')}"
-                else:
-                    line = str(entry)
-                if any(t in line.lower() for t in search_terms if t):
-                    entries.append(line)
+            line = _format_log_line(entry)
+            if any(t in line.lower() for t in search_terms if t):
+                entries.append(line)
         if not entries:
             return f"No log entries found for device: {device}"
         return "\n".join(entries[-lines:])
@@ -528,12 +568,27 @@ def call_tool(name, args):
         return json.dumps(output, ensure_ascii=False, indent=2)
 
     elif name == "get_wifi_stations":
-        result = rci({"show": {"associations": {}}})
-        stations = result.get("show", {}).get("associations", {}).get("station", [])
+        # Direct associations (controller only)
+        assoc_result = rci({"show": {"associations": {}}})
+        stations = assoc_result.get("show", {}).get("associations", {}).get("station", [])
+        assoc_by_mac = {s.get("mac", "").lower(): s for s in stations}
+
+        # All clients from hotspot (includes extender clients via mws-backhaul)
+        hotspot_result = rci({"show": {"ip": {"hotspot": {}}}})
+        hosts = hotspot_result.get("show", {}).get("ip", {}).get("hotspot", {}).get("host", [])
+
         output = []
+        seen_macs = set()
+
+        # Controller-connected stations (from associations)
         for s in stations:
+            mac = s.get("mac", "").lower()
+            seen_macs.add(mac)
+            host = next((h for h in hosts if h.get("mac", "").lower() == mac), {})
             output.append({
-                "mac": s.get("mac"),
+                "name": host.get("name", host.get("hostname", "")),
+                "mac": mac,
+                "node": "controller",
                 "ap": s.get("ap"),
                 "rssi": s.get("rssi"),
                 "mode": s.get("mode"),
@@ -544,6 +599,36 @@ def call_tool(name, args):
                 "uptime": s.get("uptime"),
                 "security": s.get("security")
             })
+
+        # Extender clients (mws-backhaul=True, active, wifi)
+        for h in hosts:
+            if not h.get("active"):
+                continue
+            if not h.get("mws-backhaul"):
+                continue
+            mac = h.get("mac", "").lower()
+            if mac in seen_macs:
+                continue
+            if h.get("system-mode") == "extender":
+                continue
+            if h.get("port"):  # wired
+                continue
+            mws = h.get("mws", {})
+            output.append({
+                "name": h.get("name", h.get("hostname", "")),
+                "mac": mac,
+                "node": "extender",
+                "ap": mws.get("ap", ""),
+                "rssi": mws.get("rssi"),
+                "mode": mws.get("mode"),
+                "txrate": mws.get("txrate"),
+                "rxrate": None,  # not available via hotspot for extender clients
+                "txbytes": h.get("txbytes"),
+                "rxbytes": h.get("rxbytes"),
+                "uptime": mws.get("uptime"),
+                "security": mws.get("security")
+            })
+
         return json.dumps(output, ensure_ascii=False, indent=2)
 
     elif name == "get_traffic":
@@ -775,14 +860,22 @@ def call_tool(name, args):
         sys_result = rci({"show": {"version": {}, "system": {}}})
         version = sys_result.get("show", {}).get("version", {})
         total_clients = sum(1 for h in hosts if h.get("active") and not h.get("system-mode"))
+        controller_clients = sum(
+            1 for h in hosts
+            if h.get("active") and not h.get("system-mode") and not h.get("mws-backhaul")
+        )
+        extender_clients = sum(
+            1 for h in hosts
+            if h.get("active") and not h.get("system-mode") and h.get("mws-backhaul")
+        )
         nodes = [{
             "role": "controller",
             "name": version.get("description", ""),
             "model": version.get("hw_id", ""),
             "firmware": version.get("release", ""),
+            "active_clients": controller_clients,
             "total_active_clients": total_clients,
             "connection": "direct",
-            "note": "Client distribution per node not available via RCI in NDMS 5.x"
         }]
         for e in extenders:
             nodes.append({
@@ -795,7 +888,8 @@ def call_tool(name, args):
                 "connection_speed_mbps": e.get("speed"),
                 "uptime_sec": e.get("uptime"),
                 "port": e.get("port"),
-                "active": e.get("active")
+                "active": e.get("active"),
+                "active_clients": extender_clients,
             })
         return json.dumps(nodes, ensure_ascii=False, indent=2)
 
