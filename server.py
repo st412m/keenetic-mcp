@@ -17,7 +17,7 @@ USER = "admin"
 PASS = "password"
 SECRET = "changeme"
 PORT = 9584
-VERSION = "1.9.0"
+VERSION = "2.0.0"
 
 # Backup config
 BACKUP_ENABLED = False
@@ -67,7 +67,7 @@ def load_env():
 
 
 # ---------------------------------------------------------------------------
-# Auth & RCI
+# Auth & RCI — controller
 # ---------------------------------------------------------------------------
 
 def auth():
@@ -123,6 +123,51 @@ def rci(commands, timeout=10):
             resp = do_request()
             return json.loads(resp.read())
         raise
+
+
+# ---------------------------------------------------------------------------
+# Auth & RCI — mesh extender nodes
+# ---------------------------------------------------------------------------
+
+def _auth_node(ip):
+    """Authenticate on a mesh extender node and return session cookie."""
+    req = urllib.request.Request(f"http://{ip}/auth")
+    try:
+        urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            realm = e.headers.get("X-NDM-Realm", "")
+            challenge = e.headers.get("X-NDM-Challenge", "")
+            cookie = e.headers.get("Set-Cookie", "").split(";")[0]
+            md5_pass = hashlib.md5(f"{USER}:{realm}:{PASS}".encode()).hexdigest()
+            sha256_hash = hashlib.sha256(f"{challenge}{md5_pass}".encode()).hexdigest()
+            payload = json.dumps({"login": USER, "password": sha256_hash}).encode()
+            req2 = urllib.request.Request(
+                f"http://{ip}/auth",
+                data=payload,
+                headers={"Content-Type": "application/json", "Cookie": cookie},
+                method="POST"
+            )
+            resp = urllib.request.urlopen(req2)
+            cookie2 = resp.headers.get("Set-Cookie", "").split(";")[0]
+            return cookie2 or cookie
+    return None
+
+
+def _rci_node(ip, commands, timeout=15):
+    """Execute RCI command on a specific mesh extender node."""
+    cookie = _auth_node(ip)
+    if not cookie:
+        raise RuntimeError(f"Auth failed on {ip}")
+    payload = json.dumps(commands).encode()
+    req = urllib.request.Request(
+        f"http://{ip}/rci/",
+        data=payload,
+        headers={"Content-Type": "application/json", "Cookie": cookie},
+        method="POST"
+    )
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    return json.loads(resp.read())
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +362,20 @@ def _get_hotspot_hosts():
     """Fetch all hotspot hosts from RCI."""
     result = rci({"show": {"ip": {"hotspot": {}}}})
     return result.get("show", {}).get("ip", {}).get("hotspot", {}).get("host", [])
+
+
+def _get_extender_hosts():
+    """Return list of active extender nodes from hotspot."""
+    hosts = _get_hotspot_hosts()
+    return [
+        {
+            "ip": h.get("ip"),
+            "mac": h.get("mac"),
+            "name": h.get("name", h.get("hostname", h.get("mac"))),
+        }
+        for h in hosts
+        if h.get("system-mode") == "extender" and h.get("active") and h.get("ip")
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +857,44 @@ def tool_get_mesh_nodes(args):
     return json.dumps(nodes, ensure_ascii=False, indent=2)
 
 
+def tool_get_extender_log(args):
+    lines = args.get("lines", 50)
+    filter_text = args.get("filter", "")
+    target_ip = args.get("extender_ip", "").strip()
+
+    extenders = _get_extender_hosts()
+    if not extenders:
+        return "No active extenders found"
+
+    if target_ip:
+        extenders = [e for e in extenders if e["ip"] == target_ip]
+        if not extenders:
+            return f"Extender {target_ip} not found or not active"
+
+    output = []
+    for ext in extenders:
+        ip = ext["ip"]
+        name = ext["name"]
+        try:
+            result = _rci_node(ip, {"show": {"log": {}}}, timeout=20)
+            log_dict = _parse_log_dict(result)
+            entries = []
+            for k in sorted(log_dict.keys(), key=lambda x: int(x) if x.isdigit() else 0):
+                line = _format_log_line(log_dict[k])
+                entries.append(line)
+            if filter_text:
+                entries = [l for l in entries if filter_text.lower() in l.lower()]
+            entries = entries[-lines:]
+            output.append(f"[extender: {ip} — {name}]")
+            output.extend(entries)
+            output.append("")
+        except Exception as e:
+            output.append(f"[extender: {ip} — {name}] ERROR: {e}")
+            output.append("")
+
+    return "\n".join(output).strip()
+
+
 def tool_reboot(args):
     rci({"system": {"reboot": {}}})
     return "Reboot command sent"
@@ -941,6 +1038,15 @@ TOOLS = {
         "description": "Get Mesh Wi-Fi system nodes: controller and extenders with client count, firmware, uptime and connection speed",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_mesh_nodes,
+    },
+    "get_extender_log": {
+        "description": "Get system log from mesh extender(s). Extenders are discovered automatically. If extender_ip is not specified, fetches logs from all active extenders.",
+        "inputSchema": {"type": "object", "properties": {
+            "extender_ip": {"type": "string", "description": "Extender IP address (optional, default: all extenders)"},
+            "lines": {"type": "integer", "description": "Number of log lines per extender (default 50)"},
+            "filter": {"type": "string", "description": "Filter text to search in log lines"},
+        }},
+        "fn": tool_get_extender_log,
     },
     "reboot": {
         "description": "Reboot the router",
