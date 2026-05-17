@@ -501,6 +501,7 @@ def call_tool(name, args):
         lines = args.get("lines", 50)
         filter_text = args.get("filter", "")
         result = rci({"show": {"log": {}}}, timeout=30)
+        return json.dumps(result, ensure_ascii=False, indent=2)
         log_dict = result.get("show", {}).get("log", {}).get("log", {})
         if not log_dict:
             log_dict = result.get("show", {}).get("log", {})
