@@ -2,7 +2,7 @@
 
 MCP (Model Context Protocol) server for Keenetic routers. Runs directly on the router via Entware. Allows Claude AI to monitor and manage your router.
 
-Tested on: **Keenetic Giga KN-1010**, KeeneticOS 5.0.11, arch `mipsel`.
+Tested on: **Keenetic Giga KN-1010**, KeeneticOS 5.0.11, arch `mips`.
 
 ## Available Tools
 
@@ -35,6 +35,7 @@ Tested on: **Keenetic Giga KN-1010**, KeeneticOS 5.0.11, arch `mipsel`.
 
 ### Mesh
 - `get_mesh_nodes` — get Mesh Wi-Fi system nodes: controller and extenders with firmware, uptime and connection speed
+- `get_extender_log` — get system log directly from mesh extender(s); extenders are discovered automatically, optional filter by IP, line count and text
 
 ### Security
 - `get_web_access` — list of web applications exposed to the internet via Keenetic DDNS
@@ -177,12 +178,13 @@ In Claude.ai go to Settings -> Integrations -> Add custom connector and paste th
 
 ## Notes
 
-- All 23 tools tested on NDMS 5.0.11
+- All 24 tools tested on NDMS 5.0.11
 - `get_wifi` uses `show interface` (`show wireless` endpoint removed in NDMS 5.x)
 - `get_traffic` aggregates rx/tx from active clients and shows top 10 by usage
 - `get_channel_analysis` uses site survey data to recommend least congested channel
 - `get_log_by_device` resolves device name/IP to MAC for more accurate log matching
 - Mesh extender clients are fully visible in `get_clients` and `get_wifi_stations` — each device includes a `node` field (`controller` or `extender`) indicating which mesh node it is connected to
+- `get_extender_log` authenticates on each extender node independently using the same credentials as the controller; extenders are discovered dynamically from the hotspot table — no hardcoded IPs
 - Port forwarding and firewall rules are not available via RCI in NDMS 5.x
 - Backup scheduler runs in a background thread — no cron or external tools needed
 - PID file is stored in `/tmp` (RAM), server output goes to `/dev/null` — no flash writes on startup
