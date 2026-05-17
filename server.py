@@ -504,6 +504,9 @@ def call_tool(name, args):
         log_dict = result.get("show", {}).get("log", {}).get("log", {})
         if not log_dict:
             log_dict = result.get("show", {}).get("log", {})
+        if log_dict:
+            last_key = sorted(log_dict.keys(), key=lambda x: int(x) if x.isdigit() else 0)[-1]
+            return json.dumps(log_dict[last_key], indent=2)  # TEMP DEBUG
         entries = []
         for k in sorted(log_dict.keys(), key=lambda x: int(x) if x.isdigit() else 0):
             entry = log_dict[k]
