@@ -290,7 +290,7 @@ def _format_log_line(entry):
     if not isinstance(entry, dict):
         return str(entry)
     msg = entry.get("message", {})
-    time_str = entry.get("time", "")
+    time_str = entry.get("timestamp", "")
     source = entry.get("source", "")
     if isinstance(msg, dict):
         label = msg.get("label", "?")
@@ -501,13 +501,9 @@ def call_tool(name, args):
         lines = args.get("lines", 50)
         filter_text = args.get("filter", "")
         result = rci({"show": {"log": {}}}, timeout=30)
-        return json.dumps(result, ensure_ascii=False, indent=2)
         log_dict = result.get("show", {}).get("log", {}).get("log", {})
         if not log_dict:
             log_dict = result.get("show", {}).get("log", {})
-        if log_dict:
-            last_key = sorted(log_dict.keys(), key=lambda x: int(x) if x.isdigit() else 0)[-1]
-            return json.dumps(log_dict[last_key], indent=2)  # TEMP DEBUG
         entries = []
         for k in sorted(log_dict.keys(), key=lambda x: int(x) if x.isdigit() else 0):
             entry = log_dict[k]
