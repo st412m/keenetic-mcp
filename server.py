@@ -289,10 +289,9 @@ def _format_log_line(entry):
     """Format a log entry dict into a readable string with timestamp."""
     if not isinstance(entry, dict):
         return str(entry)
-    return json.dumps(entry)  # TEMP DEBUG
     msg = entry.get("message", {})
     time_str = entry.get("timestamp", "")
-    source = entry.get("source", "")
+    ident = entry.get("ident", "")
     if isinstance(msg, dict):
         label = msg.get("label", "?")
         text = msg.get("message", "")
@@ -302,8 +301,8 @@ def _format_log_line(entry):
     parts = [f"[{label}]"]
     if time_str:
         parts.append(time_str)
-    if source:
-        parts.append(source)
+    if ident:
+        parts.append(ident + ":")
     parts.append(text)
     return " ".join(parts)
 
