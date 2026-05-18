@@ -122,7 +122,7 @@ Default password: keenetic. Change it immediately:
 ### Step 3 — Install dependencies
 
     opkg update
-    opkg install python3 git git-http nano curl
+    opkg install python3 git git-http nano curl rsync
 
 ### Step 4 — Clone and configure
 
