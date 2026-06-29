@@ -17,7 +17,7 @@ USER = "admin"
 PASS = "password"
 SECRET = "changeme"
 PORT = 9584
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 # Backup config
 BACKUP_ENABLED = False
@@ -1087,6 +1087,17 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
                 "serverInfo": {"name": "keenetic-mcp", "version": VERSION},
             }
             self.wfile.write(json.dumps(caps).encode())
+        elif self.path == f"/{SECRET}/reboot":
+            try:
+                tool_reboot({})
+                ok, msg, code = True, "Reboot command sent", 200
+            except Exception as e:
+                ok, msg, code = False, str(e), 500
+            syslog(f"WARNING: HTTP reboot trigger -> {msg}")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ok": ok, "result": msg}).encode())
         else:
             self.send_response(404)
             self.end_headers()
@@ -1129,7 +1140,6 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.end_headers()
         self.wfile.write(json.dumps(response).encode())
-
 
 # ---------------------------------------------------------------------------
 # Entry point

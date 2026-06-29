@@ -82,6 +82,20 @@ cat /opt/etc/keenetic-backup-rsa.pub | ssh user@nas-host "mkdir -p ~/.ssh && cat
 ```
 
 You can also trigger a backup manually at any time via the `backup_config` MCP tool.
+## HTTP Reboot Endpoint
+
+Besides the MCP protocol (POST `/<MCP_SECRET>`), the server exposes a plain
+authenticated endpoint that reboots the router over HTTP:
+GET /<MCP_SECRET>/reboot
+It runs the same `reboot` tool (`system reboot` over RCI) and returns
+`{"ok": true, "result": "Reboot command sent"}`. Protected by the same secret
+token in the URL path.
+
+Intended for automated recovery — e.g. a Home Assistant `rest_command` that
+reboots the router on a WAN outage. Use the **LAN IP**, not the DDNS host, so it
+works while the uplink is down:
+curl http://192.168.1.1:9584/YOUR_MCP_SECRET/reboot
+⚠️ Reboots the router immediately — no confirmation step.
 
 ## Requirements
 
