@@ -17,7 +17,7 @@ USER = "admin"
 PASS = "password"
 SECRET = "changeme"
 PORT = 9584
-VERSION = "2.1.0"
+VERSION = "2.2.0"
 
 # Backup config
 BACKUP_ENABLED = False
@@ -228,7 +228,7 @@ def fetch_running_config():
     return data
 
 
-def rsync_to_remote(local_file, filename):
+def rsync_to_remote(local_file, filename, timeout=60):
     if subprocess.run(["which", "rsync"], capture_output=True).returncode != 0:
         syslog("ERROR: rsync not found, install it: opkg install rsync")
         return False
@@ -237,7 +237,7 @@ def rsync_to_remote(local_file, filename):
     if BACKUP_RSYNC_KEY:
         cmd += ["-e", f"ssh -i {BACKUP_RSYNC_KEY} -o StrictHostKeyChecking=no"]
     cmd += [local_file, remote]
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if result.returncode == 0:
         syslog(f"INFO: backup synced to {BACKUP_RSYNC_HOST}:{BACKUP_RSYNC_PATH}/{filename}")
         return True
@@ -895,6 +895,45 @@ def tool_get_extender_log(args):
     return "\n".join(output).strip()
 
 
+def dump_log_to_nas(timeout=12):
+    """Snapshot the router log to /tmp (tmpfs/RAM) and rsync it to NAS.
+    Used before a reboot so the pre-reboot log survives. No flash writes."""
+    if not (BACKUP_RSYNC_HOST and BACKUP_RSYNC_USER and BACKUP_RSYNC_PATH):
+        syslog("WARNING: log dump skipped, NAS rsync not configured")
+        return False
+    try:
+        log_text = tool_get_log({"lines": 2000})
+    except Exception as e:
+        syslog(f"ERROR: log dump failed to fetch log: {e}")
+        return False
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    filename = f"keenetic-log-{ts}.txt"
+    tmp_path = f"/tmp/{filename}"  # /tmp = tmpfs (RAM), not flash
+    try:
+        with open(tmp_path, "w") as f:
+            f.write(log_text)
+    except Exception as e:
+        syslog(f"ERROR: log dump failed to write tmp: {e}")
+        return False
+    try:
+        ok = rsync_to_remote(tmp_path, filename, timeout=timeout)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except Exception:
+            pass
+    if ok:
+        syslog(f"INFO: log snapshot synced to NAS: {filename}")
+    return ok
+
+
+def tool_dump_log(args):
+    ok = dump_log_to_nas()
+    if ok:
+        return "Log snapshot synced to NAS"
+    return "Log dump failed or NAS not configured (see syslog)"
+
+
 def tool_reboot(args):
     rci({"system": {"reboot": {}}})
     return "Reboot command sent"
@@ -1058,6 +1097,11 @@ TOOLS = {
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_backup_config,
     },
+    "dump_log": {
+        "description": "Snapshot the current router log and rsync it to the NAS backup path (RAM-only staging, no flash writes). Useful to preserve the log before a reboot.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "fn": tool_dump_log,
+    },
 }
 
 
@@ -1088,16 +1132,21 @@ class MCPHandler(http.server.BaseHTTPRequestHandler):
             }
             self.wfile.write(json.dumps(caps).encode())
         elif self.path == f"/{SECRET}/reboot":
+            log_synced = False
+            try:
+                log_synced = dump_log_to_nas()
+            except Exception as e:
+                syslog(f"ERROR: pre-reboot log dump crashed: {e}")
             try:
                 tool_reboot({})
                 ok, msg, code = True, "Reboot command sent", 200
             except Exception as e:
                 ok, msg, code = False, str(e), 500
-            syslog(f"WARNING: HTTP reboot trigger -> {msg}")
+            syslog(f"WARNING: HTTP reboot trigger -> {msg} (log_synced={log_synced})")
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps({"ok": ok, "result": msg}).encode())
+            self.wfile.write(json.dumps({"ok": ok, "log_synced": log_synced, "result": msg}).encode())
         else:
             self.send_response(404)
             self.end_headers()

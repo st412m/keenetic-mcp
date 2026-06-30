@@ -43,6 +43,7 @@ Tested on: **Keenetic Giga KN-1010**, KeeneticOS 5.0.11, arch `mips`.
 ### Management
 - `reboot` — reboot the router
 - `backup_config` — manually trigger a router config backup right now
+- `dump_log` — snapshot the current router log and rsync it to the NAS backup path (RAM staging, no flash writes)
 
 ## Config Backup
 
@@ -82,19 +83,35 @@ cat /opt/etc/keenetic-backup-rsa.pub | ssh user@nas-host "mkdir -p ~/.ssh && cat
 ```
 
 You can also trigger a backup manually at any time via the `backup_config` MCP tool.
+
 ## HTTP Reboot Endpoint
 
 Besides the MCP protocol (POST `/<MCP_SECRET>`), the server exposes a plain
 authenticated endpoint that reboots the router over HTTP:
+
+```
 GET /<MCP_SECRET>/reboot
+```
+
 It runs the same `reboot` tool (`system reboot` over RCI) and returns
-`{"ok": true, "result": "Reboot command sent"}`. Protected by the same secret
-token in the URL path.
+`{"ok": true, "log_synced": <bool>, "result": "Reboot command sent"}`. Protected
+by the same secret token in the URL path.
+
+Before rebooting, the endpoint first snapshots the current router log and rsyncs
+it to the NAS backup path (see Config Backup) so the pre-reboot log survives the
+reboot. The snapshot is staged in `/tmp` (tmpfs/RAM) — no writes to the USB
+flash. If the NAS backup is not configured the dump is skipped and the reboot
+still proceeds; `log_synced` reports the result. The same snapshot can be taken
+on demand, without rebooting, via the `dump_log` MCP tool.
 
 Intended for automated recovery — e.g. a Home Assistant `rest_command` that
 reboots the router on a WAN outage. Use the **LAN IP**, not the DDNS host, so it
 works while the uplink is down:
+
+```
 curl http://192.168.1.1:9584/YOUR_MCP_SECRET/reboot
+```
+
 ⚠️ Reboots the router immediately — no confirmation step.
 
 ## Requirements
