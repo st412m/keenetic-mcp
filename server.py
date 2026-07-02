@@ -17,7 +17,7 @@ USER = "admin"
 PASS = "password"
 SECRET = "changeme"
 PORT = 9584
-VERSION = "2.2.1"
+VERSION = "2.2.2"
 
 # Backup config
 BACKUP_ENABLED = False
@@ -771,24 +771,64 @@ def tool_run_ping(args):
     return r.stdout if r.stdout else r.stderr
 
 
+
+def _rci_statuses(result):
+    """Extract flat list of status dicts from an RCI response (any depth)."""
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            st = node.get("status")
+            if isinstance(st, list):
+                found.extend(s for s in st if isinstance(s, dict))
+            for v in node.values():
+                walk(v)
+        elif isinstance(node, list):
+            for v in node:
+                walk(v)
+
+    walk(result)
+    return found
+
+
+def _rci_errors(result):
+    return [s for s in _rci_statuses(result) if s.get("status") == "error"]
+
+
+def _save_config():
+    """Persist running-config so changes survive a reboot (web UI does this
+    automatically; raw RCI writes do not)."""
+    try:
+        rci({"system": {"configuration": {"save": {}}}})
+        return True
+    except Exception as e:
+        syslog(f"WARNING: config save failed: {e}")
+        return False
+
+
 def tool_register_client(args):
     mac = args.get("mac", "").lower().strip()
     name_val = args.get("name", "").strip()
     ip_val = args.get("ip", "").strip()
     if not mac or not name_val:
         return "Error: mac and name required"
-    # NOTE: "registered" is a read-only status field reported by `show ip
-    # hotspot host` (whether a host has a name assigned), not a writable RCI
-    # leaf. Sending it in a write payload gets silently rejected by the
-    # router - assigning "name" is what actually registers the host.
-    payload = {"mac": mac, "name": name_val}
-    if ip_val:
-        payload["ip"] = ip_val
-    result = rci({"ip": {"hotspot": {"host": payload}}})
-    statuses = result.get("ip", {}).get("hotspot", {}).get("host", {}).get("status", [])
-    errors = [s for s in statuses if s.get("status") == "error"]
+    # Registration in KeeneticOS lives in the KnownHosts tree:
+    #   known host <name> <mac>          (Core::KnownHosts)
+    # NOT in `ip hotspot host`, which only manages access/policy/schedule
+    # for hosts that are already known ("name" there is a read-only echo).
+    result = rci({"known": {"host": {"name": name_val, "mac": mac}}})
+    errors = _rci_errors(result)
     if errors:
         return f"Error registering {mac}: " + json.dumps(errors, ensure_ascii=False)
+    if ip_val:
+        # Static DHCP binding: `ip dhcp host <mac> <ip>`
+        result_ip = rci({"ip": {"dhcp": {"host": {"mac": mac, "ip": ip_val}}}})
+        ip_errors = _rci_errors(result_ip)
+        if ip_errors:
+            _save_config()
+            return (f"Device {mac} registered as '{name_val}', but static IP failed: "
+                    + json.dumps(ip_errors, ensure_ascii=False))
+    _save_config()
     return f"Device {mac} registered as '{name_val}'" + (f" with IP {ip_val}" if ip_val else "")
 
 
@@ -796,17 +836,27 @@ def tool_update_client(args):
     mac = args.get("mac", "").lower().strip()
     if not mac:
         return "Error: mac required"
-    payload = {"mac": mac}
+    changed = {}
     if args.get("name"):
-        payload["name"] = args["name"].strip()
+        name_val = args["name"].strip()
+        result = rci({"known": {"host": {"name": name_val, "mac": mac}}})
+        errors = _rci_errors(result)
+        if errors:
+            return f"Error updating name for {mac}: " + json.dumps(errors, ensure_ascii=False)
+        changed["name"] = name_val
     if args.get("ip"):
-        payload["ip"] = args["ip"].strip()
-    result = rci({"ip": {"hotspot": {"host": payload}}})
-    statuses = result.get("ip", {}).get("hotspot", {}).get("host", {}).get("status", [])
-    errors = [s for s in statuses if s.get("status") == "error"]
-    if errors:
-        return f"Error updating {mac}: " + json.dumps(errors, ensure_ascii=False)
-    return f"Device {mac} updated: " + json.dumps({k: v for k, v in payload.items() if k != "mac"})
+        ip_val = args["ip"].strip()
+        result = rci({"ip": {"dhcp": {"host": {"mac": mac, "ip": ip_val}}}})
+        errors = _rci_errors(result)
+        if errors:
+            if changed:
+                _save_config()
+            return f"Error updating IP for {mac}: " + json.dumps(errors, ensure_ascii=False)
+        changed["ip"] = ip_val
+    if not changed:
+        return "Error: nothing to update (provide name and/or ip)"
+    _save_config()
+    return f"Device {mac} updated: " + json.dumps(changed, ensure_ascii=False)
 
 
 def tool_block_client(args):
@@ -816,8 +866,14 @@ def tool_block_client(args):
     result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "deny"}}}})
     statuses = result.get("ip", {}).get("hotspot", {}).get("host", {}).get("status", [])
     if any(s.get("code") == "19007441" for s in statuses):
-        rci({"ip": {"hotspot": {"host": {"mac": mac, "name": "Blocked Device"}}}})
+        # Unregistered host: register it first via KnownHosts, then deny.
+        reg = rci({"known": {"host": {"name": "Blocked Device", "mac": mac}}})
+        reg_errors = _rci_errors(reg)
+        if reg_errors:
+            return "Error auto-registering before block: " + json.dumps(reg_errors, ensure_ascii=False)
         result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "deny"}}}})
+    if not _rci_errors(result):
+        _save_config()
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
@@ -826,6 +882,8 @@ def tool_unblock_client(args):
     if not mac:
         return "Error: mac address required"
     result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "permit"}}}})
+    if not _rci_errors(result):
+        _save_config()
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
