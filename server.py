@@ -17,7 +17,7 @@ USER = "admin"
 PASS = "password"
 SECRET = "changeme"
 PORT = 9584
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 
 # Backup config
 BACKUP_ENABLED = False
@@ -777,10 +777,18 @@ def tool_register_client(args):
     ip_val = args.get("ip", "").strip()
     if not mac or not name_val:
         return "Error: mac and name required"
-    payload = {"mac": mac, "name": name_val, "registered": True}
+    # NOTE: "registered" is a read-only status field reported by `show ip
+    # hotspot host` (whether a host has a name assigned), not a writable RCI
+    # leaf. Sending it in a write payload gets silently rejected by the
+    # router - assigning "name" is what actually registers the host.
+    payload = {"mac": mac, "name": name_val}
     if ip_val:
         payload["ip"] = ip_val
-    rci({"ip": {"hotspot": {"host": payload}}})
+    result = rci({"ip": {"hotspot": {"host": payload}}})
+    statuses = result.get("ip", {}).get("hotspot", {}).get("host", {}).get("status", [])
+    errors = [s for s in statuses if s.get("status") == "error"]
+    if errors:
+        return f"Error registering {mac}: " + json.dumps(errors, ensure_ascii=False)
     return f"Device {mac} registered as '{name_val}'" + (f" with IP {ip_val}" if ip_val else "")
 
 
@@ -793,7 +801,11 @@ def tool_update_client(args):
         payload["name"] = args["name"].strip()
     if args.get("ip"):
         payload["ip"] = args["ip"].strip()
-    rci({"ip": {"hotspot": {"host": payload}}})
+    result = rci({"ip": {"hotspot": {"host": payload}}})
+    statuses = result.get("ip", {}).get("hotspot", {}).get("host", {}).get("status", [])
+    errors = [s for s in statuses if s.get("status") == "error"]
+    if errors:
+        return f"Error updating {mac}: " + json.dumps(errors, ensure_ascii=False)
     return f"Device {mac} updated: " + json.dumps({k: v for k, v in payload.items() if k != "mac"})
 
 
@@ -804,7 +816,7 @@ def tool_block_client(args):
     result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "deny"}}}})
     statuses = result.get("ip", {}).get("hotspot", {}).get("host", {}).get("status", [])
     if any(s.get("code") == "19007441" for s in statuses):
-        rci({"ip": {"hotspot": {"host": {"mac": mac, "name": "Blocked Device", "registered": True}}}})
+        rci({"ip": {"hotspot": {"host": {"mac": mac, "name": "Blocked Device"}}}})
         result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "deny"}}}})
     return json.dumps(result, ensure_ascii=False, indent=2)
 
