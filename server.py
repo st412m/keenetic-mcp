@@ -17,7 +17,7 @@ USER = "admin"
 PASS = "password"
 SECRET = "changeme"
 PORT = 9584
-VERSION = "2.2.2"
+VERSION = "2.3.0"
 
 # Backup config
 BACKUP_ENABLED = False
@@ -384,6 +384,17 @@ def _get_extender_hosts():
 
 def tool_get_system_info(args):
     result = rci({"show": {"version": {}, "system": {}}})
+    extra = {"mcp_server_version": VERSION}
+    uptime = result.get("show", {}).get("system", {}).get("uptime")
+    try:
+        secs = int(uptime)
+        extra["uptime_human"] = "%dd %dh %dm" % (
+            secs // 86400, secs % 86400 // 3600, secs % 3600 // 60)
+        extra["boot_time"] = datetime.fromtimestamp(
+            time.time() - secs).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        pass
+    result["mcp"] = extra
     return json.dumps(result, ensure_ascii=False, indent=2)
 
 
@@ -465,6 +476,7 @@ def tool_get_log(args):
         entries.append(_format_log_line(log_dict[k]))
     if filter_text:
         entries = [l for l in entries if filter_text.lower() in l.lower()]
+    entries = _log_time_window(entries, args.get("since"), args.get("until"))
     return "\n".join(entries[-lines:])
 
 
@@ -1018,6 +1030,325 @@ def tool_backup_config(args):
 
 
 # ---------------------------------------------------------------------------
+# v2.3.0 - observability helpers
+# ---------------------------------------------------------------------------
+
+# rci_query is GET-only under /rci/show/. These subtrees are refused outright:
+# running-config has its own masked tool, the rest carry keys and hashes.
+RCI_GET_BLACKLIST = ("running-config", "crypto", "ppp", "user")
+RCI_MAX_CHARS = 40000
+
+SECRET_PATTERNS = [
+    (re.compile(r"(\bmd5\s+)\S+", re.I), r"\1***"),
+    (re.compile(r"(\bnthash\s+)\S+", re.I), r"\1***"),
+    (re.compile(r"(\bpassword\s+)\S+", re.I), r"\1***"),
+    (re.compile(r"(\bpsk\s+)\S+", re.I), r"\1***"),
+    (re.compile(r"(\bwpa-psk\s+)\S+", re.I), r"\1***"),
+    (re.compile(r"(\bsecret\s+)\S+", re.I), r"\1***"),
+    (re.compile(r"(private-key\s+)\S+", re.I), r"\1***"),
+    (re.compile(r"(\bkey\s+)[A-Za-z0-9+/=]{16,}", re.I), r"\1***"),
+]
+
+_LOG_TS_RE = re.compile(r"([A-Z][a-z]{2})\s+(\d{1,2})\s+(\d{2}):(\d{2}):(\d{2})")
+_MONTHS = {m: i + 1 for i, m in enumerate(
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"])}
+
+
+def _rci_get(path, timeout=15):
+    """GET /rci/<path>. Read-only by construction: there is no request body
+    here, and writing to RCI requires a POST with one."""
+    global session_cookie
+    if not session_cookie:
+        auth()
+
+    def do_request():
+        req = urllib.request.Request(
+            "%s/rci/%s" % (HOST, path),
+            headers={"Cookie": session_cookie or ""},
+            method="GET",
+        )
+        return urllib.request.urlopen(req, timeout=timeout)
+
+    try:
+        resp = do_request()
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            session_cookie = None
+            auth()
+            resp = do_request()
+        else:
+            raise
+    return resp.read().decode("utf-8", "replace")
+
+
+def _running_config_lines():
+    data = json.loads(fetch_running_config())
+    if isinstance(data, list):
+        return [str(x) for x in data]
+    if isinstance(data, dict):
+        for key in ("running-config", "config", "message"):
+            val = data.get(key)
+            if isinstance(val, list):
+                return [str(x) for x in val]
+    return str(data).splitlines()
+
+
+def _mask_secrets(lines):
+    out = []
+    for line in lines:
+        for pat, repl in SECRET_PATTERNS:
+            line = pat.sub(repl, line)
+        out.append(line)
+    return out
+
+
+def _config_lines(prefix, lines=None):
+    """Top-level running-config lines starting with prefix."""
+    src = lines if lines is not None else _running_config_lines()
+    return [l.strip() for l in src
+            if not l.startswith(" ") and l.strip().startswith(prefix)]
+
+
+def _config_blocks(prefix, lines=None):
+    """Top-level entries starting with prefix, together with their indented
+    children. Returns a list of lists of stripped strings."""
+    src = lines if lines is not None else _running_config_lines()
+    blocks, cur = [], None
+    for l in src:
+        stripped = l.strip()
+        if not l.startswith(" "):
+            if stripped.startswith(prefix):
+                cur = [stripped]
+                blocks.append(cur)
+            else:
+                cur = None
+        elif cur is not None and stripped and stripped != "!":
+            cur.append(stripped)
+    return blocks
+
+
+def _parse_bound(text):
+    """Accepts 'HH:MM', 'HH:MM:SS' or 'Jul 24 08:00[:SS]'."""
+    if not text:
+        return None
+    text = str(text).strip()
+    now = datetime.now()
+    m = re.match(r"^(\d{1,2}):(\d{2})(?::(\d{2}))?$", text)
+    if m:
+        hh, mm, ss = m.group(1), m.group(2), m.group(3) or "0"
+        return datetime(now.year, now.month, now.day, int(hh), int(mm), int(ss))
+    m = re.match(r"^([A-Za-z]{3})\s+(\d{1,2})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$", text)
+    if m:
+        mon = _MONTHS.get(m.group(1).title())
+        if mon:
+            return datetime(now.year, mon, int(m.group(2)),
+                            int(m.group(3)), int(m.group(4)),
+                            int(m.group(5) or 0))
+    return None
+
+
+def _log_time_window(entries, since=None, until=None):
+    lo, hi = _parse_bound(since), _parse_bound(until)
+    if not lo and not hi:
+        return entries
+    out = []
+    for line in entries:
+        m = _LOG_TS_RE.search(line)
+        if not m:
+            continue
+        mon = _MONTHS.get(m.group(1))
+        if not mon:
+            continue
+        try:
+            ts = datetime(datetime.now().year, mon, int(m.group(2)),
+                          int(m.group(3)), int(m.group(4)), int(m.group(5)))
+        except ValueError:
+            continue
+        if lo and ts < lo:
+            continue
+        if hi and ts > hi:
+            continue
+        out.append(line)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# v2.3.0 - tools
+# ---------------------------------------------------------------------------
+
+def tool_rci_query(args):
+    path = args.get("path", "").strip().strip("/")
+    if not path:
+        return ("Error: path required. Examples: 'system', 'media', 'clock', "
+                "'schedule', 'dns-proxy', 'interface/GigabitEthernet1'")
+    path = path.replace("..", "").strip("/")
+    low = path.lower()
+    for bad in RCI_GET_BLACKLIST:
+        if low.startswith(bad):
+            hint = " Use get_config instead (masked)." if bad == "running-config" else ""
+            return "Error: '%s' is blacklisted for rci_query.%s" % (bad, hint)
+    try:
+        raw = _rci_get("show/%s" % path)
+    except urllib.error.HTTPError as e:
+        return "HTTP %s for show/%s - the path probably does not exist" % (e.code, path)
+    except Exception as e:
+        return "Error querying show/%s: %s" % (path, e)
+    if len(raw) > RCI_MAX_CHARS:
+        return raw[:RCI_MAX_CHARS] + "\n... [truncated, %d chars total]" % len(raw)
+    return raw
+
+
+def tool_get_config(args):
+    flt = str(args.get("filter", "") or "").strip()
+    try:
+        limit = min(int(args.get("limit", 400)), 2000)
+    except (TypeError, ValueError):
+        limit = 400
+    try:
+        lines = _running_config_lines()
+    except Exception as e:
+        return "Error fetching running-config: %s" % e
+    if flt:
+        try:
+            rx = re.compile(flt, re.I)
+        except re.error as e:
+            return "Error: bad regex %r: %s" % (flt, e)
+        lines = [l for l in lines if rx.search(l)]
+    if not args.get("include_secrets"):
+        lines = _mask_secrets(lines)
+    total = len(lines)
+    shown = lines[:limit]
+    head = "# %d line(s) matched" % total
+    if total > len(shown):
+        head += ", showing first %d" % len(shown)
+    return head + "\n" + "\n".join(shown)
+
+
+def tool_get_port_forwarding(args):
+    try:
+        rules = _config_lines("ip static")
+    except Exception as e:
+        return "Error: %s" % e
+    if not rules:
+        return "No 'ip static' rules (port forwarding / NAT) found in running-config"
+    return json.dumps({"count": len(rules), "rules": rules},
+                      ensure_ascii=False, indent=2)
+
+
+def tool_get_firewall_rules(args):
+    try:
+        lines = _running_config_lines()
+    except Exception as e:
+        return "Error: %s" % e
+    acl = _config_blocks("access-list", lines)
+    ip_fw = _config_lines("ip firewall", lines)
+    iface_acl = [l for l in _config_lines("ip access-group", lines)]
+    if not acl and not ip_fw and not iface_acl:
+        return "No firewall rules (access-list / ip firewall) found in running-config"
+    return json.dumps({
+        "access_lists": [{"name": b[0], "rules": b[1:]} for b in acl],
+        "ip_firewall": ip_fw,
+        "access_groups": iface_acl,
+    }, ensure_ascii=False, indent=2)
+
+
+def tool_get_dhcp_static(args):
+    try:
+        hosts = _config_lines("ip dhcp host")
+    except Exception as e:
+        return "Error: %s" % e
+    if not hosts:
+        return "No static DHCP reservations ('ip dhcp host') found"
+    return json.dumps({"count": len(hosts), "hosts": hosts},
+                      ensure_ascii=False, indent=2)
+
+
+def tool_get_keendns_mappings(args):
+    """KeenDNS / web-access mappings straight from running-config.
+    Complements get_web_access, which reads the generated nginx config."""
+    try:
+        blocks = _config_blocks("ip http proxy", _running_config_lines())
+    except Exception as e:
+        return "Error: %s" % e
+    if not blocks:
+        return "No 'ip http proxy' entries found in running-config"
+    return json.dumps([{"proxy": b[0], "settings": b[1:]} for b in blocks],
+                      ensure_ascii=False, indent=2)
+
+
+def tool_get_media(args):
+    try:
+        data = json.loads(_rci_get("show/media"))
+    except Exception as e:
+        return "Error reading show/media: %s" % e
+
+    def _mb(v):
+        try:
+            return round(int(v) / 1048576.0, 1)
+        except (TypeError, ValueError):
+            return None
+
+    out = []
+    for name, m in (data or {}).items():
+        if not isinstance(m, dict):
+            continue
+        for pid, p in (m.get("partition") or {}).items():
+            out.append({
+                "media": name,
+                "bus": m.get("bus"),
+                "product": str(m.get("product", "")).strip(),
+                "media_state": m.get("state"),
+                "removable": m.get("removable"),
+                "partition": pid,
+                "uuid": p.get("uuid"),
+                "label": p.get("label"),
+                "fstype": p.get("fstype"),
+                "state": p.get("state"),
+                "total_mb": _mb(p.get("total")),
+                "free_mb": _mb(p.get("free")),
+                "used_by": p.get("used-by") or [],
+            })
+    return json.dumps(out, ensure_ascii=False, indent=2)
+
+
+def tool_get_opkg_status(args):
+    try:
+        info = json.loads(_rci_get("opkg"))
+    except Exception as e:
+        return "Error reading /rci/opkg: %s" % e
+    mounted = False
+    try:
+        with open("/proc/mounts") as f:
+            mounted = any(" /opt " in line for line in f)
+    except Exception:
+        pass
+    result = {"opkg": info, "opt_mounted": mounted}
+    if not mounted:
+        result["hint"] = ("/opt is NOT mounted - Entware is down. Rebind the drive "
+                          "from Home Assistant (shell_command.keenetic_opkg_rebind) "
+                          "or via the web UI. Do NOT do it over SSH: dropbear lives "
+                          "on /opt and would kill its own session.")
+    return json.dumps(result, ensure_ascii=False, indent=2)
+
+
+def tool_list_backups(args):
+    if not (BACKUP_RSYNC_HOST and BACKUP_RSYNC_USER and BACKUP_RSYNC_PATH):
+        return "rsync backup target is not configured (BACKUP_RSYNC_* in .env)"
+    if subprocess.run(["which", "rsync"], capture_output=True).returncode != 0:
+        return "rsync not found on the router: opkg install rsync"
+    cmd = ["rsync", "--list-only"]
+    if BACKUP_RSYNC_KEY:
+        cmd += ["-e", "ssh -i %s -o StrictHostKeyChecking=no" % BACKUP_RSYNC_KEY]
+    cmd += ["%s@%s:%s/" % (BACKUP_RSYNC_USER, BACKUP_RSYNC_HOST, BACKUP_RSYNC_PATH)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return "Timeout listing %s:%s" % (BACKUP_RSYNC_HOST, BACKUP_RSYNC_PATH)
+    return r.stdout.strip() or r.stderr.strip() or "(empty listing)"
+
+
+# ---------------------------------------------------------------------------
 # Tool registry & dispatcher
 # ---------------------------------------------------------------------------
 
@@ -1048,11 +1379,10 @@ TOOLS = {
         "fn": tool_get_interfaces,
     },
     "get_log": {
-        "description": "Get system log entries with timestamps",
+        "description": "Get system log entries with timestamps. Supports an optional time window via since/until ('HH:MM', 'HH:MM:SS' or 'Jul 24 08:00').",
         "inputSchema": {"type": "object", "properties": {
             "lines": {"type": "integer", "description": "Number of lines (default 50)"},
-            "filter": {"type": "string", "description": "Filter text to search in log lines"},
-        }},
+            "filter": {"type": "string", "description": "Filter text to search in log lines"}, "since": {"type": "string", "description": "Only entries at or after this time"}, "until": {"type": "string", "description": "Only entries at or before this time"}}},
         "fn": tool_get_log,
     },
     "get_log_by_device": {
@@ -1171,6 +1501,78 @@ TOOLS = {
         "description": "Snapshot the current router log and rsync it to the NAS backup path (RAM-only staging, no flash writes). Useful to preserve the log before a reboot.",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_dump_log,
+    },
+    "rci_query": {
+        "description": (
+            "Raw READ-ONLY query against the router's RCI tree. Performs GET "
+            "/rci/show/<path> - it cannot write, because writing requires a POST "
+            "body and this tool never sends one. Use it to explore state that has "
+            "no dedicated tool yet. Useful paths: 'clock', 'schedule', 'dns-proxy', "
+            "'media', 'ntp', 'ip/hotspot', 'interface/GigabitEthernet1', "
+            "'components', 'ndns', 'update'. Blacklisted: running-config (use "
+            "get_config), crypto, ppp, user."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path under /rci/show/, e.g. 'media'"}
+            },
+            "required": ["path"],
+        },
+        "fn": tool_rci_query,
+    },
+    "get_config": {
+        "description": (
+            "Read the router's running-config with an optional regex filter. "
+            "Secrets (md5/nthash/psk/password/private-key) are masked unless "
+            "include_secrets is true. Examples: filter='ip static' for port "
+            "forwarding, 'access-list' for firewall, 'ip dhcp host' for static "
+            "reservations, 'ip http proxy' for KeenDNS."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "filter": {"type": "string", "description": "Case-insensitive regex"},
+                "limit": {"type": "integer", "description": "Max lines returned (default 400, max 2000)"},
+                "include_secrets": {"type": "boolean", "description": "Return unmasked secrets (default false)"},
+            },
+        },
+        "fn": tool_get_config,
+    },
+    "get_port_forwarding": {
+        "description": "List port forwarding / static NAT rules ('ip static') from running-config",
+        "inputSchema": {"type": "object", "properties": {}},
+        "fn": tool_get_port_forwarding,
+    },
+    "get_firewall_rules": {
+        "description": "List firewall rules: access-lists with their entries, ip firewall settings and interface access-groups",
+        "inputSchema": {"type": "object", "properties": {}},
+        "fn": tool_get_firewall_rules,
+    },
+    "get_dhcp_static": {
+        "description": "List static DHCP reservations ('ip dhcp host'). Unlike get_dhcp_leases, which only shows dynamic pool leases, this shows fixed bindings.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "fn": tool_get_dhcp_static,
+    },
+    "get_keendns_mappings": {
+        "description": "KeenDNS / web-access mappings from running-config ('ip http proxy'). Complements get_web_access, which reads the generated nginx config instead.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "fn": tool_get_keendns_mappings,
+    },
+    "get_media": {
+        "description": "Storage overview: internal flash and USB drives with partition UUID, label, filesystem, state, free space and which subsystem uses them (e.g. opkg). Use it to check whether the Entware drive is healthy.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "fn": tool_get_media,
+    },
+    "get_opkg_status": {
+        "description": "Entware/OPKG state: which drive is bound, the initrc path, and whether /opt is actually mounted. If opt_mounted is false, keenetic-mcp itself is running on borrowed time.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "fn": tool_get_opkg_status,
+    },
+    "list_backups": {
+        "description": "List config backup files already present on the NAS (rsync --list-only). Confirms that scheduled backups actually arrived.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "fn": tool_list_backups,
     },
 }
 
