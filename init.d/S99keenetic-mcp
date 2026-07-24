@@ -1,22 +1,110 @@
 #!/bin/sh
+#
+# S99keenetic-mcp - Entware init script for keenetic-mcp
+#
+# Changes vs the previous version:
+#   * stop/restart kill orphaned server processes, not just the pid stored in
+#     the pid-file. Rebinding /opt (or any second rc.unslung run) calls start
+#     again: a new server.py is spawned and the pid-file is overwritten, while
+#     the previous process survives - python keeps its inode across the
+#     unmount and keeps holding the socket. The new instance then dies with
+#     "OSError: [Errno 125] Address already in use" and the port keeps being
+#     served by the OLD version. Killing by pid-file alone can never fix that.
+#   * start is self-healing: it kills whatever is already running first.
+#   * output goes to /tmp/keenetic-mcp.log (tmpfs/RAM, never the USB flash),
+#     truncated at LOG_MAX so it cannot eat /tmp.
+#   * python3 -u - without it stdout is block-buffered and a crash takes the
+#     traceback with it.
+#   * new "status" command: live instances + listening socket.
+
+SERVER="/opt/keenetic-mcp/server.py"
+PIDFILE="/tmp/keenetic-mcp.pid"
+LOGFILE="/tmp/keenetic-mcp.log"
+LOG_MAX=262144                          # 256 KB - /tmp is RAM
+PORT=9584
+
+# Read /proc directly instead of parsing ps: busybox ps and procps ps disagree
+# about what a bare "ps" lists (own tty vs everything), /proc does not.
+# Two conditions, both required: argv[0] must be a python interpreter and the
+# command line must contain the server path. A shell that merely mentions the
+# path (this script, rc.unslung, an ssh command line) has argv[0] = /bin/sh and
+# is never matched - which matters, because these pids get killed.
+running_pids() {
+    for d in /proc/[0-9]*; do
+        pid="${d#/proc/}"
+        [ "$pid" = "$$" ] && continue
+        [ -r "$d/cmdline" ] || continue
+        argv0=$(tr '\0' '\n' < "$d/cmdline" 2>/dev/null | head -n 1)
+        case "$argv0" in
+            *python*) ;;
+            *) continue ;;
+        esac
+        cmd=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null)
+        case "$cmd" in
+            *"$SERVER"*) echo "$pid" ;;
+        esac
+    done
+}
+
+kill_all() {
+    kill "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
+    for p in $(running_pids); do
+        kill "$p" 2>/dev/null
+    done
+    sleep 1
+    for p in $(running_pids); do
+        kill -9 "$p" 2>/dev/null
+    done
+    rm -f "$PIDFILE"
+}
+
+rotate_log() {
+    if [ -f "$LOGFILE" ]; then
+        size=$(wc -c < "$LOGFILE" 2>/dev/null | tr -d ' ')
+        if [ -n "$size" ] && [ "$size" -gt "$LOG_MAX" ]; then
+            : > "$LOGFILE"
+        fi
+    fi
+    echo "=== $(date '+%Y-%m-%d %H:%M:%S') start ===" >> "$LOGFILE"
+}
+
+do_start() {
+    kill_all                            # never leave a second instance behind
+    rotate_log
+    python3 -u "$SERVER" >> "$LOGFILE" 2>&1 &
+    echo $! > "$PIDFILE"
+    echo "Keenetic MCP started (pid $(cat "$PIDFILE" 2>/dev/null), log $LOGFILE)"
+}
 
 case "$1" in
     start)
-        python3 /opt/keenetic-mcp/server.py > /dev/null 2>&1 &
-        echo $! > /tmp/keenetic-mcp.pid
-        echo "Keenetic MCP started"
+        do_start
         ;;
     stop)
-        kill $(cat /tmp/keenetic-mcp.pid 2>/dev/null) 2>/dev/null
-        rm -f /tmp/keenetic-mcp.pid
+        kill_all
         echo "Keenetic MCP stopped"
         ;;
     restart)
-        $0 stop
+        # No re-exec of "$0": rc.unslung may call this script by a relative
+        # path, and "$0 stop" would then fail silently.
+        kill_all
         sleep 1
-        $0 start
+        do_start
+        ;;
+    status)
+        pids=$(running_pids | tr '\n' ' ')
+        count=$(running_pids | wc -l | tr -d ' ')
+        if [ -n "$pids" ]; then
+            echo "running: $pids"
+            if [ "$count" -gt 1 ]; then
+                echo "WARNING: $count instances - run '$0 restart'"
+            fi
+        else
+            echo "not running"
+        fi
+        netstat -ln 2>/dev/null | grep ":$PORT " || true
         ;;
     *)
-        echo "Usage: $0 {start|stop|restart}"
+        echo "Usage: $0 {start|stop|restart|status}"
         ;;
 esac
