@@ -463,3 +463,38 @@ def tool_get_extender_log(args):
             output.append("")
 
     return "\n".join(output).strip()
+
+
+def tool_get_dns_proxy(args):
+    data = rci({"show": {"dns-proxy": {}}})
+    proxies = data.get("proxy-status", []) if isinstance(data, dict) else []
+    if not proxies:
+        return "No DNS proxy status returned"
+    out = []
+    for p in proxies:
+        if not isinstance(p, dict):
+            continue
+        cfg = p.get("proxy-config", "") or ""
+        upstreams, static = [], []
+        for line in cfg.splitlines():
+            line = line.strip()
+            if line.startswith("dns_server"):
+                # dns_server = 127.0.0.1:40500 . # 1.1.1.1@cloudflare-dns.com
+                rhs = line.split("=", 1)[1].strip() if "=" in line else line
+                local = rhs.split()[0] if rhs else ""
+                real = rhs.split("#", 1)[1].strip() if "#" in rhs else None
+                upstreams.append({"local": local, "server": real})
+            elif line.startswith("static_a ") or line.startswith("static_aaaa "):
+                static.append(line)
+        dot = [
+            {"address": s.get("address"), "sni": s.get("sni")}
+            for s in p.get("proxy-tls", {}).get("server-tls", [])
+            if isinstance(s, dict)
+        ]
+        out.append({
+            "proxy": p.get("proxy-name"),
+            "upstreams": upstreams,
+            "dot_servers": dot,
+            "static_records": static,
+        })
+    return json.dumps(out, ensure_ascii=False, indent=2)

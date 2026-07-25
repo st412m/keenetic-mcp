@@ -15,7 +15,7 @@ USER = "admin"
 PASS = "password"
 SECRET = "changeme"
 PORT = 9584
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 
 # Backup config
 BACKUP_ENABLED = False
@@ -29,11 +29,24 @@ BACKUP_RSYNC_PATH = ""
 
 session_cookie = None
 
+# Objects the write tools must never touch. Populated in load_env() from the
+# MCP_PROTECTED_* env vars, plus automatic self-protection (own port /
+# upstream / proxy name) so a config mistake can never sever this server's
+# own channel.
+PROTECTED_PORTS = set()
+PROTECTED_PROXY_NAMES = set()
+PROTECTED_UPSTREAMS = set()
+
+
+def _csv(value):
+    return [x.strip() for x in str(value or "").split(",") if x.strip()]
+
 
 def load_env():
     global HOST, USER, PASS, SECRET, PORT
     global BACKUP_ENABLED, BACKUP_SCHEDULE, BACKUP_PATH, BACKUP_KEEP
     global BACKUP_RSYNC_HOST, BACKUP_RSYNC_USER, BACKUP_RSYNC_KEY, BACKUP_RSYNC_PATH
+    global PROTECTED_PORTS, PROTECTED_PROXY_NAMES, PROTECTED_UPSTREAMS
 
     env_file = os.path.join(os.path.dirname(__file__), ".env")
     if os.path.exists(env_file):
@@ -58,6 +71,29 @@ def load_env():
     BACKUP_RSYNC_USER = os.environ.get("BACKUP_RSYNC_USER", "")
     BACKUP_RSYNC_KEY = os.environ.get("BACKUP_RSYNC_KEY", "")
     BACKUP_RSYNC_PATH = os.environ.get("BACKUP_RSYNC_PATH", "")
+
+    # Protected objects for the write tools. The MCP's own port, its
+    # 127.0.0.1:<port> upstream and the 'keenetic-mcp' proxy name are always
+    # protected; everything else is opt-in via MCP_PROTECTED_*.
+    PROTECTED_PORTS = {PORT}
+    for p in _csv(os.environ.get("MCP_PROTECTED_PORTS", "")):
+        try:
+            PROTECTED_PORTS.add(int(p))
+        except ValueError:
+            pass
+
+    PROTECTED_PROXY_NAMES = {"keenetic-mcp"}
+    PROTECTED_PROXY_NAMES.update(
+        n.lower() for n in _csv(os.environ.get("MCP_PROTECTED_PROXY_NAMES", "")))
+
+    PROTECTED_UPSTREAMS = {("127.0.0.1", PORT)}
+    for u in _csv(os.environ.get("MCP_PROTECTED_UPSTREAMS", "")):
+        host, sep, port = u.rpartition(":")
+        if sep:
+            try:
+                PROTECTED_UPSTREAMS.add((host, int(port)))
+            except ValueError:
+                pass
 
 
 def auth():

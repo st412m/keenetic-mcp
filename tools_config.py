@@ -10,6 +10,7 @@ import threading
 import time
 from datetime import datetime
 
+import core
 from core import _rci_get, rci
 from helpers import _config_blocks, _config_lines, _get_hotspot_hosts, _mask_secrets, _rci_errors, _rci_statuses, _running_config_lines, _save_config
 
@@ -17,12 +18,6 @@ from helpers import _config_blocks, _config_lines, _get_hotspot_hosts, _mask_sec
 RCI_GET_BLACKLIST = ("running-config", "crypto", "ppp", "user")
 RCI_MAX_CHARS = 40000
 
-
-PROTECTED_PROXY_NAMES = {
-    "keenetic-mcp", "ha-mcp", "vault-mcp", "adb-mcp", "homeassistant", "ntfy",
-}
-PROTECTED_PORTS = {9584, 8123, 9583, 3100, 3200, 7612}
-PROTECTED_UPSTREAMS = {("127.0.0.1", 9584)}
 
 _MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
 _IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
@@ -75,7 +70,7 @@ def _guard_port(port, what):
         raise GuardError("port '%s' is not a number" % port)
     if not 1 <= port_i <= 65535:
         raise GuardError("port %s is out of range" % port)
-    if port_i in PROTECTED_PORTS:
+    if port_i in core.PROTECTED_PORTS:
         raise GuardError(
             "port %s is protected (%s): it serves keenetic-mcp or another MCP "
             "endpoint. Change it by hand in the web UI if you really mean to."
@@ -87,7 +82,7 @@ def _guard_proxy_name(name):
     name = str(name or "").strip()
     if not name:
         raise GuardError("proxy name is required")
-    if name.lower() in PROTECTED_PROXY_NAMES:
+    if name.lower() in core.PROTECTED_PROXY_NAMES:
         raise GuardError(
             "KeenDNS mapping '%s' is protected - removing or repointing it would "
             "cut the channel this server is reached through. Web UI only." % name)
@@ -95,7 +90,7 @@ def _guard_proxy_name(name):
 
 
 def _guard_upstream(host, port):
-    if (str(host), int(port)) in PROTECTED_UPSTREAMS:
+    if (str(host), int(port)) in core.PROTECTED_UPSTREAMS:
         raise GuardError("upstream %s:%s is protected" % (host, port))
 
 

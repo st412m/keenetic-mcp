@@ -11,8 +11,8 @@ import time
 from datetime import datetime
 
 from tools_config import tool_get_config, tool_get_dhcp_static, tool_get_firewall_rules, tool_get_keendns_mappings, tool_get_port_forwarding, tool_rci_query, tool_remove_dhcp_host, tool_remove_keendns_mapping, tool_remove_port_forwarding, tool_set_dhcp_host, tool_set_keendns_mapping, tool_set_port_forwarding
-from tools_network import tool_get_channel_analysis, tool_get_clients, tool_get_dhcp_leases, tool_get_extender_log, tool_get_interfaces, tool_get_internet_status, tool_get_log, tool_get_log_by_device, tool_get_mesh_nodes, tool_get_site_survey, tool_get_traffic, tool_get_unregistered_clients, tool_get_vpn_status, tool_get_web_access, tool_get_wifi, tool_get_wifi_stations
-from tools_system import tool_backup_config, tool_block_client, tool_dump_log, tool_get_media, tool_get_opkg_status, tool_get_system_info, tool_list_backups, tool_reboot, tool_register_client, tool_run_ping, tool_unblock_client, tool_update_client
+from tools_network import tool_get_channel_analysis, tool_get_clients, tool_get_dhcp_leases, tool_get_extender_log, tool_get_interfaces, tool_get_internet_status, tool_get_log, tool_get_log_by_device, tool_get_mesh_nodes, tool_get_site_survey, tool_get_traffic, tool_get_unregistered_clients, tool_get_vpn_status, tool_get_web_access, tool_get_wifi, tool_get_wifi_stations, tool_get_dns_proxy
+from tools_system import tool_backup_config, tool_block_client, tool_dump_log, tool_get_media, tool_get_opkg_status, tool_get_system_info, tool_list_backups, tool_reboot, tool_register_client, tool_run_ping, tool_unblock_client, tool_update_client, tool_get_schedule
 
 
 WRITE_TOOLS = {
@@ -324,6 +324,16 @@ TOOLS = {
         "description": "List config backup files already present on the NAS (rsync --list-only). Confirms that scheduled backups actually arrived.",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_list_backups,
+    },
+    "get_dns_proxy": {
+        "description": "DNS proxy status: upstream resolvers (with DoT SNI) and static A/AAAA records from the router's DNS proxy.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "fn": tool_get_dns_proxy,
+    },
+    "get_schedule": {
+        "description": "List router schedules (e.g. the firmware auto-update window) with name, weekday/time actions and seconds until the next fire.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "fn": tool_get_schedule,
     },
 }
 

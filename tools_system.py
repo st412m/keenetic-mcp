@@ -247,3 +247,39 @@ def tool_list_backups(args):
     except subprocess.TimeoutExpired:
         return "Timeout listing %s:%s" % (core.BACKUP_RSYNC_HOST, core.BACKUP_RSYNC_PATH)
     return r.stdout.strip() or r.stderr.strip() or "(empty listing)"
+
+
+def tool_get_schedule(args):
+    # Runtime view (next fire, seconds left, resolved dow/time) comes from
+    # show/schedule; the human-readable name lives in the config tree.
+    show = rci({"show": {"schedule": {}}}) or {}
+    try:
+        tree = json.loads(_rci_get("schedule")) or {}
+    except Exception:
+        tree = {}
+    out = []
+    for sid in sorted(set(show) | set(tree)):
+        s = show.get(sid, {})
+        t = tree.get(sid, {})
+        if not isinstance(s, dict):
+            s = {}
+        if not isinstance(t, dict):
+            t = {}
+        actions = [
+            {
+                "type": a.get("type"),
+                "dow": a.get("dow"),
+                "time": a.get("time"),
+                "next": a.get("next", False),
+                "seconds_left": a.get("left"),
+            }
+            for a in s.get("action", []) if isinstance(a, dict)
+        ]
+        out.append({
+            "id": sid,
+            "name": t.get("description"),
+            "actions": actions,
+        })
+    if not out:
+        return "No schedules configured"
+    return json.dumps(out, ensure_ascii=False, indent=2)
