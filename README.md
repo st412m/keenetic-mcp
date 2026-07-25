@@ -4,7 +4,7 @@ MCP (Model Context Protocol) server for Keenetic routers. Runs directly on the r
 
 Tested on: **Keenetic Giga KN-1010 + KN-1011 (Mesh)**, KeeneticOS **5.1.1** (`5.01.C.1.0-0`), Entware `mipselsf`.
 
-Current version: **2.3.0** — 34 tools, no dependencies outside the Python standard library.
+Current version: **2.4.0** — 40 tools, no dependencies outside the Python standard library.
 
 ## Available Tools
 
@@ -36,7 +36,24 @@ Current version: **2.3.0** — 34 tools, no dependencies outside the Python stan
 - `get_port_forwarding` — port forwarding / static NAT rules (`ip static`)
 - `get_firewall_rules` — access-lists with their entries, `ip firewall` settings and interface access-groups
 - `get_keendns_mappings` — KeenDNS / web application access mappings (`ip http proxy`) with their upstreams
-- `rci_query` — raw **read-only** query against the RCI tree: `GET /rci/show/<path>`. It cannot write, by construction — writing to RCI requires a POST body and this tool never sends one. Useful for state that has no dedicated tool yet: `clock`, `schedule`, `ntp`, `dns-proxy`, `update`, `components`, `ndns`, `interface/GigabitEthernet1`. Blacklisted subtrees: `running-config` (use `get_config`), `crypto`, `ppp`, `user`. Output is capped at 40 000 characters
+- `rci_query` — raw **read-only** query against the RCI tree: `GET /rci/show/<path>`, or `GET /rci/<path>` with `config_tree: true`. It cannot write, by construction — writing to RCI requires a POST body and this tool never sends one. Use the default tree for state (`clock`, `schedule`, `ntp`, `dns-proxy`, `update`, `components`, `ndns`, `interface/GigabitEthernet1`) and `config_tree` to inspect the exact write-shape of a settings branch (`ip/static`, `ip/http/proxy`, `ip/dhcp/host`). Blacklisted subtrees: `running-config` (use `get_config`), `crypto`, `ppp`, `user`. Output is capped at 40 000 characters
+
+### Configuration changes (write)
+
+Every tool below takes `dry_run`, and **it defaults to `true`**: the tool returns the exact payload it would send and changes nothing. A real write is followed by `system configuration save` (raw RCI writes do not survive a reboot without it) and by a re-read of the affected branch, so the answer contains a before/after diff rather than a "command sent" claim.
+
+- `set_port_forwarding` — create or update an `ip static` rule. The target is addressed by **MAC**, not IP: pass `to_host` as a MAC, or as the IP of a registered host, which is resolved for you and refused if the router does not know it (a typo would otherwise create a rule forwarding nowhere). Supports `to_port`, `end_port` (ranges), `comment` and `enable` — the last one being the per-rule `disable` flag
+- `remove_port_forwarding` — delete a rule by `index` (from `get_port_forwarding`) or by `port`. Ambiguous matches are refused rather than guessed
+- `set_keendns_mapping` / `remove_keendns_mapping` — manage `ip http proxy` entries: name → upstream host:port, published on the ndns domain with ssl redirect
+- `set_dhcp_host` / `remove_dhcp_host` — manage `ip dhcp host` reservations. An IP already reserved for a different MAC is refused. Note that the device *name* lives in the known-host tree — use `register_client` / `update_client` for that
+
+**Guard rails are in code, not in the description.** The following are refused outright, because it is trivially easy to shoot away the very channel this server is reached through:
+
+- KeenDNS names `keenetic-mcp`, `ha-mcp`, `vault-mcp`, `adb-mcp`, `homeassistant`, `ntfy`
+- ports 9584, 8123, 9583, 3100, 3200, 7612
+- the upstream `127.0.0.1:9584`
+
+If you genuinely need to change one of those, do it in the web interface.
 
 ### Diagnostics
 - `get_log` — system log with timestamps, optional line count, text filter and time window (`since` / `until`, accepting `HH:MM`, `HH:MM:SS` or `Jul 24 08:00`)
@@ -281,7 +298,7 @@ cleared on reboot by design — nothing is ever written to the USB flash.
 
 ## Notes
 
-- All 34 tools tested on NDMS 5.1.1
+- All 40 tools tested on NDMS 5.1.1
 - `get_wifi` uses `show interface` (`show wireless` endpoint removed in NDMS 5.x)
 - `get_traffic` aggregates rx/tx from active clients and shows top 10 by usage
 - `get_channel_analysis` uses site survey data to recommend least congested channel
@@ -290,6 +307,7 @@ cleared on reboot by design — nothing is ever written to the USB flash.
 - `get_extender_log` authenticates on each extender node independently using the same credentials as the controller; extenders are discovered dynamically from the hotspot table — no hardcoded IPs
 - Port forwarding, firewall rules, static DHCP bindings and KeenDNS mappings are not exposed as RCI `show` endpoints in NDMS 5.x, but they are all present in `running-config` — which is what `get_port_forwarding`, `get_firewall_rules`, `get_dhcp_static` and `get_keendns_mappings` parse
 - Port forwarding targets are addressed by **MAC**, not by IP (`ip static tcp GigabitEthernet1 8123 aa:bb:cc:dd:ee:ff`)
+- `disable` in an `ip static` rule is a **per-rule attribute**, not a global switch for the whole block. In `running-config` it is emitted as a separate `ip static disable` line that continues the *preceding* rule, which reads like a global directive and is not one — confirm with `rci_query path='ip/static' config_tree=true`, where the flag sits inside its own rule object
 - Backup scheduler runs in a background thread — no cron or external tools needed
 - PID file and server log live in `/tmp` (RAM) — no flash writes on startup
 
@@ -304,6 +322,7 @@ cleared on reboot by design — nothing is ever written to the USB flash.
 
 ## Changelog
 
+- **2.4.0** — write tools, 34 -> 40: `set_port_forwarding` / `remove_port_forwarding`, `set_keendns_mapping` / `remove_keendns_mapping`, `set_dhcp_host` / `remove_dhcp_host`, all with `dry_run` defaulting to true, a coded protected list, `system configuration save` after every write and a before/after verification read. `rci_query` gained `config_tree` for read-only inspection of settings branches
 - **2.3.0** — observability release, 25 -> 34 tools: `rci_query`, `get_config`, `get_port_forwarding`, `get_firewall_rules`, `get_dhcp_static`, `get_keendns_mappings`, `get_media`, `get_opkg_status`, `list_backups`; `get_system_info` reports the MCP server version, human-readable uptime and boot time; `get_log` accepts `since`/`until`
 - **2.2.2** — client registration fixed: registration lives in `known host`, static IP in `ip dhcp host`, every mutation followed by `system configuration save`
 - **2.2.0** — `dump_log` (log snapshot -> rsync to NAS, RAM staging); the `/reboot` endpoint snapshots the log before rebooting
