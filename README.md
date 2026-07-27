@@ -4,7 +4,7 @@ MCP (Model Context Protocol) server for Keenetic routers. Runs directly on the r
 
 Tested on: **Keenetic Giga KN-1010 + KN-1011 (Mesh)**, KeeneticOS **5.1.1** (`5.01.C.1.0-0`), Entware `mipselsf`.
 
-Current version: **2.4.0** — 40 tools, no dependencies outside the Python standard library.
+Current version: **2.5.0** — 42 tools, no dependencies outside the Python standard library.
 
 ## Available Tools
 
@@ -36,7 +36,9 @@ Current version: **2.4.0** — 40 tools, no dependencies outside the Python stan
 - `get_port_forwarding` — port forwarding / static NAT rules (`ip static`)
 - `get_firewall_rules` — access-lists with their entries, `ip firewall` settings and interface access-groups
 - `get_keendns_mappings` — KeenDNS / web application access mappings (`ip http proxy`) with their upstreams
-- `rci_query` — raw **read-only** query against the RCI tree: `GET /rci/show/<path>`, or `GET /rci/<path>` with `config_tree: true`. It cannot write, by construction — writing to RCI requires a POST body and this tool never sends one. Use the default tree for state (`clock`, `schedule`, `ntp`, `dns-proxy`, `update`, `components`, `ndns`, `interface/GigabitEthernet1`) and `config_tree` to inspect the exact write-shape of a settings branch (`ip/static`, `ip/http/proxy`, `ip/dhcp/host`). Blacklisted subtrees: `running-config` (use `get_config`), `crypto`, `ppp`, `user`. Output is capped at 40 000 characters
+- `get_dns_proxy` — DNS proxy status: upstream resolvers with their DoT SNI, and the static A/AAAA records the router serves
+- `get_schedule` — router schedules (the firmware auto-update window, and any others) with their name, weekday/time actions and seconds until the next fire. The auto-update window is otherwise a hardcoded assumption in recovery automations — this reads it from the router
+- `rci_query` — raw **read-only** query against the RCI tree: `GET /rci/show/<path>`, or `GET /rci/<path>` with `config_tree: true`. It cannot write, by construction — writing to RCI requires a POST body and this tool never sends one. Use the default tree for state (`ntp`, `components`, `ndns`, `interface/GigabitEthernet1`) and `config_tree` to inspect the exact write-shape of a settings branch (`ip/static`, `ip/http/proxy`, `ip/dhcp/host`). Schedules and the DNS proxy have their own named tools now. Blacklisted subtrees: `running-config` (use `get_config`), `crypto`, `ppp`, `user`. Output is capped at 40 000 characters
 
 ### Configuration changes (write)
 
@@ -47,13 +49,13 @@ Every tool below takes `dry_run`, and **it defaults to `true`**: the tool return
 - `set_keendns_mapping` / `remove_keendns_mapping` — manage `ip http proxy` entries: name → upstream host:port, published on the ndns domain with ssl redirect
 - `set_dhcp_host` / `remove_dhcp_host` — manage `ip dhcp host` reservations. An IP already reserved for a different MAC is refused. Note that the device *name* lives in the known-host tree — use `register_client` / `update_client` for that
 
-**Guard rails are in code, not in the description.** The following are refused outright, because it is trivially easy to shoot away the very channel this server is reached through:
+**Guard rails are in code, not in the description — and the list is yours to configure.** The server always protects *itself*, regardless of configuration and with no way to switch it off: its own port (`MCP_PORT`), the `127.0.0.1:<MCP_PORT>` upstream and the `keenetic-mcp` proxy name. A mistake therefore can never close the channel this server is reached through. Everything else you want shielded from the write tools goes in `.env`, comma-separated:
 
-- KeenDNS names `keenetic-mcp`, `ha-mcp`, `vault-mcp`, `adb-mcp`, `homeassistant`, `ntfy`
-- ports 9584, 8123, 9583, 3100, 3200, 7612
-- the upstream `127.0.0.1:9584`
+- `MCP_PROTECTED_PORTS` — external ports that must not be forwarded or removed
+- `MCP_PROTECTED_PROXY_NAMES` — KeenDNS proxy names that must not be changed or removed
+- `MCP_PROTECTED_UPSTREAMS` — `host:port` upstreams that must not be pointed at
 
-If you genuinely need to change one of those, do it in the web interface.
+A protected object is refused outright; if you genuinely need to change one, do it in the web interface. Leave the variables empty to protect only the server's own channel. See `.env.example` for the annotated list.
 
 ### Diagnostics
 - `get_log` — system log with timestamps, optional line count, text filter and time window (`since` / `until`, accepting `HH:MM`, `HH:MM:SS` or `Jul 24 08:00`)
@@ -76,6 +78,21 @@ If you genuinely need to change one of those, do it in the web interface.
 
 ### Security
 - `get_web_access` — web applications exposed to the internet via Keenetic DDNS, read from the generated nginx config. `get_keendns_mappings` shows the same thing from the other side (running-config) — comparing the two catches stale entries
+
+## Project structure
+
+As of 2.5.0 the server is split into flat modules in the repository root. This is a flat layout on purpose, not a Python package: `init.d` runs `python server.py` directly, so the script's directory is on `sys.path` and plain imports work with no change to how the addon starts.
+
+- `core.py` — `.env` loading, router authentication, the RCI client, and all mutable state (session cookie, protected-object sets)
+- `backup.py` — the config-backup scheduler and rsync
+- `helpers.py` — running-config parsing, secret masking, log formatting
+- `tools_network.py` — read tools for clients, WiFi, interfaces, logs, VPN, DNS proxy, mesh
+- `tools_system.py` — system info, client management, ping, media/opkg, reboot, schedules
+- `tools_config.py` — running-config readers and the write tools, with the protection guards
+- `registry.py` — the tool table and dispatcher
+- `server.py` — the HTTP / MCP transport and entry point
+
+Behaviour is identical across the split. Adding a tool means writing the function in the relevant `tools_*` module and registering it in `registry.py`.
 
 ## Config Backup
 
@@ -203,6 +220,12 @@ Fill in your credentials in `.env`:
     MCP_SECRET=some_random_secret_string
     MCP_PORT=9584
 
+Optionally, tell the write tools what else to protect besides their own channel
+(see the *Configuration changes* section and `.env.example`):
+
+    MCP_PROTECTED_PORTS=8123,9583
+    MCP_PROTECTED_PROXY_NAMES=ha-mcp,homeassistant
+
 ### Step 5 — Set up autostart
 
     cp init.d/S99keenetic-mcp /opt/etc/init.d/
@@ -285,11 +308,18 @@ from another machine.
 **`Address already in use` in the log, and an old version answers on the port.**
 An orphaned instance is still holding the socket — `/opt` being rebound spawns a
 second `server.py` and overwrites the pid-file, so the previous process survives
-(python keeps its inode across the unmount). The current init script handles
-this itself: `stop` and `restart` also kill processes matched in `/proc`, and
-`start` cleans up before spawning. Check with:
+(python keeps its inode across the unmount). The init script handles this
+itself: `stop` and `restart` also kill processes matched in `/proc` (by a python
+`argv[0]` whose command line contains the server path — a shell that merely
+mentions it is never matched), and `start` cleans up before spawning. Check
+with:
 
     /opt/etc/init.d/S99keenetic-mcp status
+
+`status` reports every live instance and warns if more than one is running. If
+you are upgrading from a build whose init script predates this, copy the current
+`init.d/S99keenetic-mcp` over by hand once — a `git pull` of the working copy
+does not replace the one already installed under `/opt/etc/init.d/`.
 
 **Nothing in the log at all.** Server output goes to `/tmp/keenetic-mcp.log`
 (RAM, truncated at 256 KB, marked with `=== <date> start ===`), and python runs
@@ -298,11 +328,12 @@ cleared on reboot by design — nothing is ever written to the USB flash.
 
 ## Notes
 
-- All 40 tools tested on NDMS 5.1.1
+- All 42 tools tested on NDMS 5.1.1
 - `get_wifi` uses `show interface` (`show wireless` endpoint removed in NDMS 5.x)
 - `get_traffic` aggregates rx/tx from active clients and shows top 10 by usage
 - `get_channel_analysis` uses site survey data to recommend least congested channel
 - `get_log_by_device` resolves device name/IP to MAC for more accurate log matching
+- `get_schedule` merges the runtime view (`show/schedule` — next fire, seconds left) with the human-readable name from the config tree; `get_dns_proxy` parses the proxy-config for upstream resolvers and static records. There is no `show/clock` or `show/update` endpoint on NDMS 5.x — the current firmware string lives in `get_system_info`
 - Mesh extender clients are fully visible in `get_clients` and `get_wifi_stations` — each device includes a `node` field (`controller` or `extender`) indicating which mesh node it is connected to
 - `get_extender_log` authenticates on each extender node independently using the same credentials as the controller; extenders are discovered dynamically from the hotspot table — no hardcoded IPs
 - Port forwarding, firewall rules, static DHCP bindings and KeenDNS mappings are not exposed as RCI `show` endpoints in NDMS 5.x, but they are all present in `running-config` — which is what `get_port_forwarding`, `get_firewall_rules`, `get_dhcp_static` and `get_keendns_mappings` parse
@@ -317,11 +348,13 @@ cleared on reboot by design — nothing is ever written to the USB flash.
 - HTTPS is handled by Keenetic built-in SSL certificate
 - `rci_query` is GET-only and cannot modify the router; `crypto`, `ppp`, `user` and `running-config` subtrees are refused outright
 - `get_config` masks secrets by default; `include_secrets: true` is opt-in and will put passwords and keys into the chat transcript
+- The write tools always protect the server's own port, upstream and proxy name; add anything else via `MCP_PROTECTED_*` in `.env`
 - Never commit `.env` — it is in `.gitignore`
 - Change the default SSH password after installation
 
 ## Changelog
 
+- **2.5.0** — modular refactor + configurable protection, 40 -> 42 tools. `server.py` is split into focused modules (`core`, `backup`, `helpers`, `tools_network`, `tools_system`, `tools_config`, `registry`, and a thin `server`) with identical behaviour. The write-tool protection list moves from hardcoded to `.env` (`MCP_PROTECTED_PORTS` / `MCP_PROTECTED_PROXY_NAMES` / `MCP_PROTECTED_UPSTREAMS`); the server's own port, `127.0.0.1:<port>` upstream and `keenetic-mcp` name are always protected automatically. Two new read tools: `get_schedule` (router schedules, incl. the firmware auto-update window) and `get_dns_proxy` (upstream resolvers with DoT SNI + static records)
 - **2.4.0** — write tools, 34 -> 40: `set_port_forwarding` / `remove_port_forwarding`, `set_keendns_mapping` / `remove_keendns_mapping`, `set_dhcp_host` / `remove_dhcp_host`, all with `dry_run` defaulting to true, a coded protected list, `system configuration save` after every write and a before/after verification read. `rci_query` gained `config_tree` for read-only inspection of settings branches
 - **2.3.0** — observability release, 25 -> 34 tools: `rci_query`, `get_config`, `get_port_forwarding`, `get_firewall_rules`, `get_dhcp_static`, `get_keendns_mappings`, `get_media`, `get_opkg_status`, `list_backups`; `get_system_info` reports the MCP server version, human-readable uptime and boot time; `get_log` accepts `since`/`until`
 - **2.2.2** — client registration fixed: registration lives in `known host`, static IP in `ip dhcp host`, every mutation followed by `system configuration save`
