@@ -4,7 +4,7 @@ MCP (Model Context Protocol) server for Keenetic routers. Runs directly on the r
 
 Tested on: **Keenetic Giga KN-1010 + KN-1011 (Mesh)**, KeeneticOS **5.1.1** (`5.01.C.1.0-0`), Entware `mipselsf`.
 
-Current version: **2.5.0** — 42 tools, no dependencies outside the Python standard library.
+Current version: **2.6.0** — 42 tools, no dependencies outside the Python standard library. Tools are reachable over MCP and, since 2.6.0, over plain HTTP for clients that do not speak the protocol (Home Assistant, curl, shell scripts).
 
 ## Available Tools
 
@@ -90,6 +90,7 @@ As of 2.5.0 the server is split into flat modules in the repository root. This i
 - `tools_system.py` — system info, client management, ping, media/opkg, reboot, schedules
 - `tools_config.py` — running-config readers and the write tools, with the protection guards
 - `registry.py` — the tool table and dispatcher
+- `http_tools.py` — the plain-HTTP access policy and query-string argument coercion (added in 2.6.0; keeps the HTTP surface out of the registry and the tool modules)
 - `server.py` — the HTTP / MCP transport and entry point
 
 Behaviour is identical across the split. Adding a tool means writing the function in the relevant `tools_*` module and registering it in `registry.py`.
@@ -133,10 +134,63 @@ cat /opt/etc/keenetic-backup-rsa.pub | ssh user@nas-host "mkdir -p ~/.ssh && cat
 
 You can trigger a backup manually at any time via `backup_config`, and verify that files really landed on the NAS via `list_backups`.
 
-## HTTP Reboot Endpoint
+## Plain HTTP endpoints
 
-Besides the MCP protocol (POST `/<MCP_SECRET>`), the server exposes a plain
-authenticated endpoint that reboots the router over HTTP:
+Besides the MCP protocol (POST `/<MCP_SECRET>`), the server answers a few plain
+`GET` requests, authenticated by the same secret token in the URL path. They
+exist for clients that cannot speak MCP — Home Assistant's `rest` sensor,
+`rest_command` and `command_line`, cron jobs, plain `curl`.
+
+### Calling tools over HTTP
+
+```
+GET /<MCP_SECRET>/tool/<name>?arg=value
+GET /<MCP_SECRET>/tools
+```
+
+`/tool/<name>` runs the same function the MCP client would and answers with
+
+```json
+{"ok": true, "tool": "get_system_info", "args": {}, "result": { ... }}
+```
+
+Most tools return a JSON document; it is parsed into `result` rather than nested
+as a string, so a template can index into it directly. Add `&raw=1` to get the
+tool's own text as `text/plain` instead — convenient for `command_line` sensors
+and for reading logs by eye. `/tools` lists what is servable right now, with
+parameter names, declared types and a `mutating` flag.
+
+**This route is read-only by default, and that is deliberate.** A secret in a
+URL is a weak credential: it lands in `configuration.yaml`, in automation
+traces, in shell history and in any proxy log along the way. So the 13 tools
+that change state — all six write tools plus `reboot`, `register_client`,
+`update_client`, `block_client`, `unblock_client`, `backup_config` and
+`dump_log` — answer **403** here no matter what. The remaining 29 read tools are
+served. To lift the gate for a specific tool, name it explicitly:
+
+    MCP_HTTP_TOOL_ALLOWLIST=register_client
+
+Setting `MCP_HTTP_TOOLS=false` turns the whole route off; `/reboot` and the MCP
+protocol are unaffected by both variables.
+
+Arguments are coerced using each tool's declared `inputSchema`, not by guessing
+from the text — a value that does not fit its declared type is a **400** with an
+explanation, never a silently wrong call:
+
+```
+$ curl 'http://192.168.1.1:9584/SECRET/tool/get_log?lines=zzz'
+{"ok": false, "tool": "get_log", "error": "parameter 'lines' must be an integer, got 'zzz'"}
+```
+
+Unknown and missing parameters are 400 as well, and the error lists what the
+tool accepts. Booleans take `true/false`, `1/0`, `yes/no` or `on/off`.
+
+⚠️ The server is single-threaded: it handles one request at a time, so a busy
+polling loop will block MCP calls. Keep `scan_interval` at 60 s or more, and
+keep the slow tools (`get_log`, which allows the router 30 s to answer,
+`get_site_survey`, `get_channel_analysis`) out of anything that polls.
+
+### Reboot endpoint
 
 ```
 GET /<MCP_SECRET>/reboot
@@ -144,7 +198,9 @@ GET /<MCP_SECRET>/reboot
 
 It runs the same `reboot` tool (`system reboot` over RCI) and returns
 `{"ok": true, "log_synced": <bool>, "result": "Reboot command sent"}`. Protected
-by the same secret token in the URL path.
+by the same secret token in the URL path. This endpoint predates the tool route
+and stays separate from it — rebooting a router is not something that should
+share a URL shape with reading a sensor.
 
 Before rebooting, the endpoint first snapshots the current router log and rsyncs
 it to the NAS backup path (see Config Backup) so the pre-reboot log survives the
@@ -162,6 +218,30 @@ curl http://192.168.1.1:9584/YOUR_MCP_SECRET/reboot
 ```
 
 ⚠️ Reboots the router immediately — no confirmation step.
+
+### Home Assistant examples
+
+A REST sensor that tracks the WAN address, and a shell-style sensor that reads
+the log:
+
+```yaml
+sensor:
+  - platform: rest
+    name: Router WAN
+    resource: http://192.168.1.1:9584/YOUR_MCP_SECRET/tool/get_internet_status
+    value_template: "{{ value_json.result[0].address }}"
+    json_attributes_path: "$.result[0]"
+    json_attributes: [uptime, defaultgw, priority]
+    scan_interval: 300
+
+rest_command:
+  router_reboot:
+    url: http://192.168.1.1:9584/YOUR_MCP_SECRET/reboot
+```
+
+Use the **LAN IP** rather than the DDNS host in automations that are meant to
+survive an outage — the DDNS name goes through the uplink you are trying to
+recover.
 
 ## Requirements
 
@@ -225,6 +305,13 @@ Optionally, tell the write tools what else to protect besides their own channel
 
     MCP_PROTECTED_PORTS=8123,9583
     MCP_PROTECTED_PROXY_NAMES=ha-mcp,homeassistant
+
+The plain-HTTP tool route is on by default and read-only. Both variables below
+can be omitted entirely; set them only to narrow or widen that (see *Plain HTTP
+endpoints*):
+
+    MCP_HTTP_TOOLS=true
+    MCP_HTTP_TOOL_ALLOWLIST=
 
 ### Step 5 — Set up autostart
 
@@ -333,6 +420,8 @@ cleared on reboot by design — nothing is ever written to the USB flash.
 - `get_traffic` aggregates rx/tx from active clients and shows top 10 by usage
 - `get_channel_analysis` uses site survey data to recommend least congested channel
 - `get_log_by_device` resolves device name/IP to MAC for more accurate log matching
+- `get_log` timestamps can lie right after a reboot, and the tool now says so. The router logs from the moment it powers on, but its clock is only correct once NTP answers — everything in between carries a time restored from flash, which can be days off. Since 2.6.0 `get_log` compares timestamps against the router's uptime and prefixes its output with `[!] N of these entries are stamped BEFORE this boot` when it finds impossible dates. Look for `Ntp::Client: time synchronized` in the log to see exactly where real time starts. A `since`/`until` window will happily match those bogus dates, because as far as the filter is concerned they are just older entries
+- A log line with no parsable timestamp inherits the timestamp of the line above it rather than being dropped from a `since`/`until` window (before 2.6.0 such lines vanished silently)
 - `get_schedule` merges the runtime view (`show/schedule` — next fire, seconds left) with the human-readable name from the config tree; `get_dns_proxy` parses the proxy-config for upstream resolvers and static records. There is no `show/clock` or `show/update` endpoint on NDMS 5.x — the current firmware string lives in `get_system_info`
 - Mesh extender clients are fully visible in `get_clients` and `get_wifi_stations` — each device includes a `node` field (`controller` or `extender`) indicating which mesh node it is connected to
 - `get_extender_log` authenticates on each extender node independently using the same credentials as the controller; extenders are discovered dynamically from the hotspot table — no hardcoded IPs
@@ -349,11 +438,14 @@ cleared on reboot by design — nothing is ever written to the USB flash.
 - `rci_query` is GET-only and cannot modify the router; `crypto`, `ppp`, `user` and `running-config` subtrees are refused outright
 - `get_config` masks secrets by default; `include_secrets: true` is opt-in and will put passwords and keys into the chat transcript
 - The write tools always protect the server's own port, upstream and proxy name; add anything else via `MCP_PROTECTED_*` in `.env`
+- The plain-HTTP tool route serves read-only tools only. State-changing tools are refused with 403 unless named in `MCP_HTTP_TOOL_ALLOWLIST` — treat adding one as handing out a write key, because the URL secret ends up in config files, automation traces and proxy logs
+- Anything reachable over MCP is reachable over the tool route with the same secret. If that is not what you want, run `MCP_HTTP_TOOLS=false`
 - Never commit `.env` — it is in `.gitignore`
 - Change the default SSH password after installation
 
 ## Changelog
 
+- **2.6.0** — plain-HTTP access to the tools, for clients that cannot speak MCP. `GET /<MCP_SECRET>/tool/<name>?arg=value` runs any tool and answers JSON (`&raw=1` for the tool's own text); `GET /<MCP_SECRET>/tools` lists what is servable. **Read-only by default:** the 13 state-changing tools return 403 unless named in the new `MCP_HTTP_TOOL_ALLOWLIST`; `MCP_HTTP_TOOLS=false` disables the route entirely. Arguments are coerced from each tool's declared `inputSchema`, so a bad type is an explicit 400 rather than a silently wrong call. The policy lives in a new `http_tools.py` — the registry and tool modules are untouched. Also fixes two `get_log` papercuts: lines with no parsable timestamp are no longer dropped from a `since`/`until` window, and output is flagged when it contains entries stamped before the current boot (pre-NTP clock)
 - **2.5.0** — modular refactor + configurable protection, 40 -> 42 tools. `server.py` is split into focused modules (`core`, `backup`, `helpers`, `tools_network`, `tools_system`, `tools_config`, `registry`, and a thin `server`) with identical behaviour. The write-tool protection list moves from hardcoded to `.env` (`MCP_PROTECTED_PORTS` / `MCP_PROTECTED_PROXY_NAMES` / `MCP_PROTECTED_UPSTREAMS`); the server's own port, `127.0.0.1:<port>` upstream and `keenetic-mcp` name are always protected automatically. Two new read tools: `get_schedule` (router schedules, incl. the firmware auto-update window) and `get_dns_proxy` (upstream resolvers with DoT SNI + static records)
 - **2.4.0** — write tools, 34 -> 40: `set_port_forwarding` / `remove_port_forwarding`, `set_keendns_mapping` / `remove_keendns_mapping`, `set_dhcp_host` / `remove_dhcp_host`, all with `dry_run` defaulting to true, a coded protected list, `system configuration save` after every write and a before/after verification read. `rci_query` gained `config_tree` for read-only inspection of settings branches
 - **2.3.0** — observability release, 25 -> 34 tools: `rci_query`, `get_config`, `get_port_forwarding`, `get_firewall_rules`, `get_dhcp_static`, `get_keendns_mappings`, `get_media`, `get_opkg_status`, `list_backups`; `get_system_info` reports the MCP server version, human-readable uptime and boot time; `get_log` accepts `since`/`until`
