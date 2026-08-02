@@ -9,30 +9,73 @@ import re
 import threading
 import time
 from datetime import datetime
+from urllib.parse import urlsplit, parse_qs, unquote
 
 import core
 from core import load_env, auth, VERSION
 from backup import syslog, backup_scheduler
 from tools_system import dump_log_to_nas, tool_reboot
 from registry import TOOLS, call_tool
+import http_tools
 
 
 class MCPHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def _send_json(self, code, payload):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_text(self, code, text):
+        body = str(text).encode("utf-8", "replace")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
-        if self.path == f"/{core.SECRET}":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            caps = {
+        parts = urlsplit(self.path)
+        path = parts.path
+        query = parse_qs(parts.query, keep_blank_values=True)
+        prefix = f"/{core.SECRET}"
+
+        if path == prefix:
+            self._send_json(200, {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "keenetic-mcp", "version": VERSION},
-            }
-            self.wfile.write(json.dumps(caps).encode())
-        elif self.path == f"/{core.SECRET}/reboot":
+            })
+        elif path == f"{prefix}/tools":
+            self._send_json(200, {
+                "ok": True,
+                "count": len(http_tools.allowed_tools()),
+                "tools": http_tools.describe_tools(),
+            })
+        elif path.startswith(f"{prefix}/tool/"):
+            name = unquote(path[len(prefix) + len("/tool/"):]).strip("/")
+            code, payload = http_tools.run(name, query)
+            if code != 200:
+                syslog(f"WARNING: HTTP tool '{name}' -> {code}: {payload.get('error')}")
+            # ?raw=1 returns the tool's own text, for command_line sensors and
+            # anything that would rather not unwrap JSON.
+            if query.get("raw") and code == 200:
+                self._send_text(200, payload["result"])
+                return
+            if code == 200:
+                # Most tools return a JSON document as text. Parse it so HA
+                # templates can index into it instead of parsing twice.
+                try:
+                    payload["result"] = json.loads(payload["result"])
+                except (TypeError, ValueError):
+                    pass
+            self._send_json(code, payload)
+        elif path == f"{prefix}/reboot":
             log_synced = False
             try:
                 log_synced = dump_log_to_nas()
@@ -101,6 +144,14 @@ if __name__ == "__main__":
         threading.Thread(target=backup_scheduler, daemon=True).start()
     else:
         syslog("INFO: backup disabled (BACKUP_ENABLED=false)")
+
+    if core.HTTP_TOOLS_ENABLED:
+        extra = sorted(core.HTTP_TOOL_ALLOWLIST & http_tools.MUTATING_TOOLS)
+        syslog("INFO: HTTP tool route enabled, %d tools servable%s"
+               % (len(http_tools.allowed_tools()),
+                  ", mutating allowed: " + ", ".join(extra) if extra else ""))
+    else:
+        syslog("INFO: HTTP tool route disabled (MCP_HTTP_TOOLS=false)")
 
     print(f"Starting Keenetic MCP v{VERSION} on port {core.PORT}")
     server = http.server.HTTPServer(("0.0.0.0", core.PORT), MCPHandler)

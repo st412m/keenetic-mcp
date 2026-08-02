@@ -11,7 +11,7 @@ import time
 from datetime import datetime
 
 from core import _rci_node, rci
-from helpers import _format_log_line, _get_ap, _get_extender_hosts, _get_hotspot_hosts, _get_node, _log_time_window, _parse_log_dict
+from helpers import _format_log_line, _get_ap, _get_extender_hosts, _get_hotspot_hosts, _get_node, _log_time_window, _parse_log_dict, pre_ntp_notice
 
 
 def tool_get_clients(args):
@@ -93,7 +93,11 @@ def tool_get_log(args):
     if filter_text:
         entries = [l for l in entries if filter_text.lower() in l.lower()]
     entries = _log_time_window(entries, args.get("since"), args.get("until"))
-    return "\n".join(entries[-lines:])
+    entries = entries[-lines:]
+    notice = pre_ntp_notice(entries)
+    if notice:
+        entries = [notice] + entries
+    return "\n".join(entries)
 
 
 def tool_get_log_by_device(args):

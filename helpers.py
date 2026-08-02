@@ -8,7 +8,7 @@ import subprocess
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from backup import fetch_running_config, syslog
 from core import rci
@@ -196,26 +196,82 @@ def _parse_bound(text):
     return None
 
 
+def _line_ts(line):
+    """Timestamp of a formatted log line, or None if it carries none."""
+    m = _LOG_TS_RE.search(line)
+    if not m:
+        return None
+    mon = _MONTHS.get(m.group(1))
+    if not mon:
+        return None
+    try:
+        return datetime(datetime.now().year, mon, int(m.group(2)),
+                        int(m.group(3)), int(m.group(4)), int(m.group(5)))
+    except ValueError:
+        return None
+
+
 def _log_time_window(entries, since=None, until=None):
     lo, hi = _parse_bound(since), _parse_bound(until)
     if not lo and not hi:
         return entries
     out = []
+    last_ts = None
     for line in entries:
-        m = _LOG_TS_RE.search(line)
-        if not m:
-            continue
-        mon = _MONTHS.get(m.group(1))
-        if not mon:
-            continue
-        try:
-            ts = datetime(datetime.now().year, mon, int(m.group(2)),
-                          int(m.group(3)), int(m.group(4)), int(m.group(5)))
-        except ValueError:
-            continue
-        if lo and ts < lo:
-            continue
-        if hi and ts > hi:
-            continue
+        ts = _line_ts(line)
+        if ts is None:
+            # A line without its own timestamp is a continuation of the one
+            # before it. Inheriting that timestamp keeps it with its parent;
+            # dropping it (the old behaviour) removed data from the window
+            # without saying so.
+            ts = last_ts
+        else:
+            last_ts = ts
+        if ts is not None:
+            if lo and ts < lo:
+                continue
+            if hi and ts > hi:
+                continue
         out.append(line)
     return out
+
+
+def router_boot_dt():
+    """Best-effort boot time from 'show system uptime'. None if unavailable."""
+    try:
+        result = rci({"show": {"system": {}}})
+        secs = int(result.get("show", {}).get("system", {}).get("uptime"))
+    except Exception:
+        return None
+    if secs < 0:
+        return None
+    return datetime.fromtimestamp(time.time() - secs)
+
+
+def pre_ntp_notice(entries):
+    """Warn about entries stamped before this boot.
+
+    The router logs from the moment it powers on, but its clock only becomes
+    correct once NTP answers. Everything written in between carries whatever
+    time was restored from flash — often days off. Those lines are real, their
+    dates are not, and nothing in the raw output says so: a time-windowed
+    query will happily place them in the wrong day. Returns a banner line, or
+    None when the log is clean.
+    """
+    boot = router_boot_dt()
+    if not boot:
+        return None
+    # A minute of slack: uptime and log timestamps are seconds-granular and
+    # the very first lines are written as the clock is still being set.
+    cutoff = boot - timedelta(minutes=1)
+    stale = [ts for ts in (_line_ts(l) for l in entries) if ts and ts < cutoff]
+    if not stale:
+        return None
+    return (
+        "[!] %d of these entries are stamped BEFORE this boot (router came up "
+        "%s), earliest %s. The clock was not NTP-synced yet, so their dates are "
+        "wrong — they belong to this boot. Search the log for "
+        "'Ntp::Client: time synchronized' to find where real time starts."
+        % (len(stale), boot.strftime("%Y-%m-%d %H:%M:%S"),
+           min(stale).strftime("%b %d %H:%M:%S"))
+    )

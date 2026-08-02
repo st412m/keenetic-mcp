@@ -15,7 +15,7 @@ USER = "admin"
 PASS = "password"
 SECRET = "changeme"
 PORT = 9584
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 
 # Backup config
 BACKUP_ENABLED = False
@@ -37,6 +37,13 @@ PROTECTED_PORTS = set()
 PROTECTED_PROXY_NAMES = set()
 PROTECTED_UPSTREAMS = set()
 
+# Plain-HTTP tool route: GET /<SECRET>/tool/<name>?arg=value
+# Lets Home Assistant (rest_command / rest sensors / command_line) call tools
+# without speaking MCP. Read-only by default: tools that change router state
+# are refused unless named explicitly in MCP_HTTP_TOOL_ALLOWLIST.
+HTTP_TOOLS_ENABLED = True
+HTTP_TOOL_ALLOWLIST = set()
+
 
 def _csv(value):
     return [x.strip() for x in str(value or "").split(",") if x.strip()]
@@ -47,6 +54,7 @@ def load_env():
     global BACKUP_ENABLED, BACKUP_SCHEDULE, BACKUP_PATH, BACKUP_KEEP
     global BACKUP_RSYNC_HOST, BACKUP_RSYNC_USER, BACKUP_RSYNC_KEY, BACKUP_RSYNC_PATH
     global PROTECTED_PORTS, PROTECTED_PROXY_NAMES, PROTECTED_UPSTREAMS
+    global HTTP_TOOLS_ENABLED, HTTP_TOOL_ALLOWLIST
 
     env_file = os.path.join(os.path.dirname(__file__), ".env")
     if os.path.exists(env_file):
@@ -94,6 +102,11 @@ def load_env():
                 PROTECTED_UPSTREAMS.add((host, int(port)))
             except ValueError:
                 pass
+
+    HTTP_TOOLS_ENABLED = os.environ.get("MCP_HTTP_TOOLS", "true").lower() == "true"
+    # Named here, a tool is served over plain HTTP even if it mutates state.
+    # Empty (the default) means: every read-only tool, no mutating ones.
+    HTTP_TOOL_ALLOWLIST = set(_csv(os.environ.get("MCP_HTTP_TOOL_ALLOWLIST", "")))
 
 
 def auth():
