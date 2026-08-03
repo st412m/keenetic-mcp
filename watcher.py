@@ -278,6 +278,20 @@ def mask_secrets(text, values=None):
     return text
 
 
+def mask_proxy(proxy, values=None):
+    """Mask the credentials in a proxy URL, keep the host and port readable.
+
+    Which proxy a rule goes through is a routing fact worth seeing when a
+    delivery fails; the password in it is not. Masking by whole value would
+    replace the entire URL with *** and take the host with it.
+    """
+    if not proxy:
+        return None
+    keep = [v for v in (values if values is not None else _secret_values())
+            if v and v != str(proxy)]
+    return mask_secrets(proxy, keep)
+
+
 def mask_headers(headers, values=None):
     out = {}
     for name, value in (headers or {}).items():
@@ -366,11 +380,55 @@ def _session_get(path, timeout):
     return resp.read().decode("utf-8", "replace")
 
 
+def _session_post(commands, timeout):
+    """POST /rci/ with a command body, on our own session, one retry after 401.
+
+    Not every read is available as a GET path: 'show log' answers 404 on
+    GET /rci/show/log and only exists as the POST form {"show": {"log": {}}}.
+    Found the hard way on 2026-08-03, when 2.7.1 first moved the log source to
+    the GET client and every log poll came back 404.
+    """
+    if not _sess["cookie"]:
+        _session_auth()
+    payload = json.dumps(commands).encode()
+
+    def do_request():
+        req = urllib.request.Request(
+            "%s/rci/" % core.HOST,
+            data=payload,
+            headers={"Content-Type": "application/json",
+                     "Cookie": _sess["cookie"] or ""},
+            method="POST",
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return opener.open(req, timeout=timeout)
+
+    try:
+        resp = do_request()
+    except urllib.error.HTTPError as e:
+        if e.code != 401:
+            raise
+        _sess["cookie"] = None
+        _session_auth()
+        resp = do_request()
+    return resp.read().decode("utf-8", "replace")
+
+
 def fetch_rci(path, timeout=LOG_FETCH_TIMEOUT):
     """Read /rci/<path> as parsed JSON. Takes the watcher's lock, never core's."""
     with _sess_lock:
         try:
             return json.loads(_session_get(path, timeout))
+        except Exception as e:
+            _sess["last_error"] = "%s %s: %s" % (_now_str(), type(e).__name__, e)
+            raise
+
+
+def fetch_rci_post(commands, timeout=LOG_FETCH_TIMEOUT):
+    """Same, for reads that only exist as a POST command body."""
+    with _sess_lock:
+        try:
+            return json.loads(_session_post(commands, timeout))
         except Exception as e:
             _sess["last_error"] = "%s %s: %s" % (_now_str(), type(e).__name__, e)
             raise
@@ -676,7 +734,7 @@ def _find_new(hashes, anchor):
 
 
 def poll_log(rules):
-    log_dict = _log_dict(fetch_rci("show/log", LOG_FETCH_TIMEOUT))
+    log_dict = _log_dict(fetch_rci_post({"show": {"log": {}}}, LOG_FETCH_TIMEOUT))
     if not isinstance(log_dict, dict):
         return
     keys = sorted(log_dict.keys(), key=lambda x: int(x) if str(x).isdigit() else 0)
@@ -1023,7 +1081,7 @@ def tool_test_watch_rule(args):
             "url": mask_secrets(url, secrets),
             "headers": mask_headers(headers, secrets),
             "body": mask_secrets(data.decode("utf-8", "replace"), secrets) if data else None,
-            "proxy": mask_secrets(rule.get("proxy"), secrets),
+            "proxy": mask_proxy(rule.get("proxy"), secrets),
         },
         "secrets_masked": True,
         "message": mask_secrets(mapping["message"], secrets),

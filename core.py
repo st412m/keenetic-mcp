@@ -15,7 +15,7 @@ USER = "admin"
 PASS = "password"
 SECRET = "changeme"
 PORT = 9584
-VERSION = "2.7.1"
+VERSION = "2.7.2"
 
 # Backup config
 BACKUP_ENABLED = False
