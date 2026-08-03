@@ -4,7 +4,7 @@ MCP (Model Context Protocol) server for Keenetic routers. Runs directly on the r
 
 Tested on: **Keenetic Giga KN-1010 + KN-1011 (Mesh)**, KeeneticOS **5.1.1** (`5.01.C.1.0-0`), Entware `mipselsf`.
 
-Current version: **2.6.0** — 42 tools, no dependencies outside the Python standard library. Tools are reachable over MCP and, since 2.6.0, over plain HTTP for clients that do not speak the protocol (Home Assistant, curl, shell scripts).
+Current version: **2.7.0** — 44 tools, no dependencies outside the Python standard library. Tools are reachable over MCP and, since 2.6.0, over plain HTTP for clients that do not speak the protocol (Home Assistant, curl, shell scripts). Since 2.7.0 the server can also push: a background watcher polls the router locally and makes an outbound HTTP call when a rule matches.
 
 ## Available Tools
 
@@ -61,6 +61,8 @@ A protected object is refused outright; if you genuinely need to change one, do 
 - `get_log` — system log with timestamps, optional line count, text filter and time window (`since` / `until`, accepting `HH:MM`, `HH:MM:SS` or `Jul 24 08:00`)
 - `get_log_by_device` — system log filtered by device MAC address, IP address or name
 - `run_ping` — ping a host directly from the router, returns latency and packet loss
+- `get_watch_status` — watcher state: rules file, per-rule poll interval, cooldown, seconds to the next poll, match/sent/failed counters and the last delivery error
+- `test_watch_rule` — render a watcher rule's outbound call with sample values (`dry_run` true by default) or actually send it, to prove the receiver is reachable from the router
 
 ### Mesh
 - `get_mesh_nodes` — Mesh Wi-Fi nodes: controller and extenders with firmware, uptime and connection speed
@@ -91,9 +93,10 @@ As of 2.5.0 the server is split into flat modules in the repository root. This i
 - `tools_config.py` — running-config readers and the write tools, with the protection guards
 - `registry.py` — the tool table and dispatcher
 - `http_tools.py` — the plain-HTTP access policy and query-string argument coercion (added in 2.6.0; keeps the HTTP surface out of the registry and the tool modules)
+- `watcher.py` — the event watcher: rule loading, log and RCI polling, deduplication, templating and the outbound call (added in 2.7.0). It is the one module that registers its own tools instead of being listed in `registry.py`, so that adding a watcher touches neither the registry nor the tool modules
 - `server.py` — the HTTP / MCP transport and entry point
 
-Behaviour is identical across the split. Adding a tool means writing the function in the relevant `tools_*` module and registering it in `registry.py`.
+Behaviour is identical across the split. Adding a tool means writing the function in the relevant `tools_*` module and registering it in `registry.py` — `watcher.py` is the deliberate exception, see above.
 
 ## Config Backup
 
@@ -162,11 +165,11 @@ parameter names, declared types and a `mutating` flag.
 
 **This route is read-only by default, and that is deliberate.** A secret in a
 URL is a weak credential: it lands in `configuration.yaml`, in automation
-traces, in shell history and in any proxy log along the way. So the 13 tools
+traces, in shell history and in any proxy log along the way. So the 14 tools
 that change state — all six write tools plus `reboot`, `register_client`,
-`update_client`, `block_client`, `unblock_client`, `backup_config` and
-`dump_log` — answer **403** here no matter what. The remaining 29 read tools are
-served. To lift the gate for a specific tool, name it explicitly:
+`update_client`, `block_client`, `unblock_client`, `backup_config`, `dump_log`
+and `test_watch_rule` — answer **403** here no matter what. The remaining 30
+read tools are served. To lift the gate for a specific tool, name it explicitly:
 
     MCP_HTTP_TOOL_ALLOWLIST=register_client
 
@@ -243,6 +246,80 @@ Use the **LAN IP** rather than the DDNS host in automations that are meant to
 survive an outage — the DDNS name goes through the uplink you are trying to
 recover.
 
+## Event watcher
+
+Everything above is pull: something asks the router a question. The watcher is push. A background thread polls the router **locally** and, when a rule matches, makes an outbound HTTP call. The point is the reversal: a poll from outside has to be slow enough not to hammer a single-threaded server, so a ten-second event is noticed a minute late, if at all. From inside, ten seconds is cheap.
+
+The watcher has no idea who it is talking to. A rule carries a complete HTTP call — method, URL, headers, body — so a home-automation webhook, ntfy, the Telegram Bot API and a log collector are all equal receivers. There is no integration with any of them to configure.
+
+### Rules
+
+Rules live in one JSON file on the router: `watch_rules.json` next to `server.py` (override with `MCP_WATCH_RULES`). Copy `watch_rules.example.json` and edit. The file is re-read when its mtime changes — no restart. There is no web interface and none is planned.
+
+```json
+{
+  "defaults": {
+    "method": "POST",
+    "url": "http://192.168.1.54:8123/api/webhook/keenetic_watch",
+    "body": {"text": "${message}"},
+    "cooldown": 60
+  },
+  "rules": [
+    {
+      "id": "vpn_login",
+      "source": "log",
+      "match": "Vpn::EventSender: \"([^\"]+)\": user \"([^\"]+)\" connected from \"([^\"]+)\"",
+      "message": "VPN login: ${m2} from ${m3}"
+    },
+    {
+      "id": "unknown_device",
+      "source": "rci",
+      "path": "show/ip/hotspot",
+      "key": "mac",
+      "where": {"active": true, "registered": false},
+      "message": "Unknown device ${mac} (${ip}, '${name}')"
+    }
+  ]
+}
+```
+
+A rule inherits everything it does not set from `defaults`, which is what keeps a working rule down to three or four lines.
+
+**Common fields:** `id`, `source` (`log` or `rci`), `enabled` (default true), `interval` seconds between polls (log: `MCP_WATCH_INTERVAL`, default 10; rci: 30), `cooldown` seconds (default 60), `max_events` per poll (default 5), `method`, `url`, `headers`, `body`, `timeout` (default 10), `proxy`, `verify_ssl`, `message`.
+
+**`source: "log"`** — `match` is a regex against the formatted log line; `exclude` is an optional counter-regex. Capture groups arrive as `${m1}`…`${m9}`, named groups under their own names, plus `${line}`, `${text}`, `${label}`, `${ident}`, `${log_time}`. Cooldown for a log rule is **per rule**: one login writes several lines, and the useful limit is "at most once every N seconds", not "once per distinct wording".
+
+Check that the event you want is actually written before building a rule on it. On KeeneticOS 5.1.1 a web-configurator login is **not logged at all** — not a successful one, not a failed one, not under `Core::Authenticator`, not by nginx (which only logs errors). Verified by logging in three times, once with a deliberately wrong password, while the log kept recording DHCP, Wi-Fi and IPsec events in the same minutes. What *is* logged: `Vpn::EventSender: ... connected from` for remote access, with user and source IP, and `Core::System::StartupConfig: saving (http/rci)` when settings are saved — the latter fires for this server's own write tools too, since the log does not say who asked. Beware also of `Core::Authenticator: user "admin" tagged with "http"`: that is the config being replayed at boot, so a rule matching `tag "http"` alone fires on every reboot.
+
+**`source: "rci"`** — `path` is an RCI path (`show/ip/hotspot`), `key` is the field identifying an item (`mac`), `where` / `where_not` select which items count, `on` is any of `appear` (default), `disappear`, `change`, and `change` compares the fields in `track`. Every field of the matched item is a placeholder, nested ones flattened with underscores (`${interface_name}`) and also exposed under their short name when nothing else claims it (`${ap}` for `mws_ap`). Cooldown here is **per item**.
+
+**Substitution** is `string.Template.safe_substitute`: an unknown `${name}` is left in the text rather than raising or silently emptying, so a typo shows up in the message instead of disappearing. When `body` is an object it is sent as JSON and the escaping is done by the JSON encoder — which is why the Telegram example passes text through a JSON body and not a hand-built string.
+
+**Secrets:** `$NAME` in a `url`, a header, the `proxy` or the `body` is expanded from the environment when the file is loaded, so a bot token, a proxy password and a chat id can live in `.env` and stay out of the rules file. Only **UPPERCASE** names are taken from the environment; event fields are lowercase, so the two namespaces cannot collide and a stray `HOME` in the environment can never eat a `${message}`. `watch_rules.json` is gitignored either way.
+
+**`proxy`** is optional and per rule. Without it the call goes out directly — no proxy handler is even constructed, and there is no global proxy setting anywhere. It takes a full HTTP-proxy URL, credentials included (`http://user:pass@host:port`) — `urllib` sends `Proxy-Authorization` on the `CONNECT`, so an authenticated proxy works without any extra code. It has to be an HTTP proxy: SOCKS needs a library outside the standard library, and this project has no dependencies. Many SOCKS endpoints also speak HTTP on the same port — a mixed inbound does — so a proxy meant for something else is often reusable here. Use it when the router itself cannot reach the receiver: a bot API blocked upstream is exactly this case, and it is the difference between an alert that arrives when the rest of the house is down and one that does not. Put it in `defaults` only when *every* receiver needs it; a rule posting to a machine on the LAN must not inherit a proxy that sends the request abroad and back.
+
+Note that the proxy does not decrypt anything — `CONNECT` forwards bytes and TLS stays end to end — so the certificate is still verified by the router's own python. If HTTPS fails on certificate verification, the router is missing a CA store (`opkg install ca-certificates`); `"verify_ssl": false` exists as a last resort and should be treated as one.
+
+### What it does not confuse itself with
+
+- **Position in the log is found by content, not by number.** The log is a RAM ring buffer: after a reboot the numbering restarts, and the lines written before NTP answers carry a date restored from flash that can be days off. Neither the index nor the timestamp can be trusted, so the watcher remembers the hashes of the last few lines and looks for them in the next poll. When it cannot find them — reboot, or a burst larger than the buffer — it adopts the current tail as the new baseline and reports nothing, rather than replaying a whole boot as news.
+- **The first sight of an RCI rule is a baseline, not an event.** Otherwise every restart would announce everything that is already there.
+- **State lives in `/tmp`** (`MCP_WATCH_STATE`), i.e. in RAM. Writing it to the USB stick is the one thing this project does not do. The cost is that a router reboot resets the baseline: a device that was already connected before the reboot becomes part of the new normal. A restart of the server alone keeps its state.
+- **One RCI conversation at a time.** The watcher thread and the HTTP server share one session cookie; since 2.7.0 `core.rci_lock` serialises them. A watcher poll can therefore delay an MCP call by up to the length of one `show log` fetch.
+
+### Checking it works
+
+```bash
+# is it running, and what has it seen
+curl -s "http://192.168.1.1:9584/<MCP_SECRET>/tool/get_watch_status" | head -40
+
+# render a rule's outbound call without sending anything
+curl -s "http://192.168.1.1:9584/<MCP_SECRET>/tool/test_watch_rule?rule_id=vpn_login"
+```
+
+`test_watch_rule` with `dry_run=false` actually sends — it is in the mutating set, so over HTTP it needs `MCP_HTTP_TOOL_ALLOWLIST`. Over MCP it is available directly.
+
 ## Requirements
 
 - Keenetic router with Entware support
@@ -313,6 +390,12 @@ endpoints*):
     MCP_HTTP_TOOLS=true
     MCP_HTTP_TOOL_ALLOWLIST=
 
+The watcher stays idle until you give it rules. To turn it on, copy the example
+and edit it (see *Event watcher*):
+
+    cp watch_rules.example.json watch_rules.json
+    nano watch_rules.json
+
 ### Step 5 — Set up autostart
 
     cp init.d/S99keenetic-mcp /opt/etc/init.d/
@@ -348,7 +431,8 @@ In Claude.ai go to Settings -> Integrations -> Add custom connector and paste th
     /opt/etc/init.d/S99keenetic-mcp restart
     /opt/etc/init.d/S99keenetic-mcp status
 
-`.env` is in `.gitignore`, so a pull never touches your credentials. The
+`.env` is in `.gitignore`, so a pull never touches your credentials. So is
+`watch_rules.json` — the example file is the one under version control. The
 autostart script itself is not updated by a pull of the working copy — after a
 release that changes it, copy it over again from `init.d/`.
 
@@ -413,9 +497,17 @@ does not replace the one already installed under `/opt/etc/init.d/`.
 with `-u` so a crashing process does not take its traceback with it. `/tmp` is
 cleared on reboot by design — nothing is ever written to the USB flash.
 
+**A watcher rule never fires.** Ask the watcher itself before suspecting the
+rule: `get_watch_status` reports whether the thread is running, whether the
+rules file parsed, when each rule last matched, and the last delivery error.
+A rule that matches but cannot deliver shows up as `failed` with the error
+attached; `test_watch_rule` with `dry_run=false` proves the receiver is
+reachable from the router, which is a different question from whether the event
+happened.
+
 ## Notes
 
-- All 42 tools tested on NDMS 5.1.1
+- All 44 tools tested on NDMS 5.1.1
 - `get_wifi` uses `show interface` (`show wireless` endpoint removed in NDMS 5.x)
 - `get_traffic` aggregates rx/tx from active clients and shows top 10 by usage
 - `get_channel_analysis` uses site survey data to recommend least congested channel
@@ -429,7 +521,8 @@ cleared on reboot by design — nothing is ever written to the USB flash.
 - Port forwarding targets are addressed by **MAC**, not by IP (`ip static tcp GigabitEthernet1 8123 aa:bb:cc:dd:ee:ff`)
 - `disable` in an `ip static` rule is a **per-rule attribute**, not a global switch for the whole block. In `running-config` it is emitted as a separate `ip static disable` line that continues the *preceding* rule, which reads like a global directive and is not one — confirm with `rci_query path='ip/static' config_tree=true`, where the flag sits inside its own rule object
 - Backup scheduler runs in a background thread — no cron or external tools needed
-- PID file and server log live in `/tmp` (RAM) — no flash writes on startup
+- PID file, server log and watcher state live in `/tmp` (RAM) — no flash writes at runtime
+- The watcher runs in a second background thread alongside the backup scheduler. With no rules file it does not start at all and says so in syslog
 
 ## Security Notes
 
@@ -440,11 +533,14 @@ cleared on reboot by design — nothing is ever written to the USB flash.
 - The write tools always protect the server's own port, upstream and proxy name; add anything else via `MCP_PROTECTED_*` in `.env`
 - The plain-HTTP tool route serves read-only tools only. State-changing tools are refused with 403 unless named in `MCP_HTTP_TOOL_ALLOWLIST` — treat adding one as handing out a write key, because the URL secret ends up in config files, automation traces and proxy logs
 - Anything reachable over MCP is reachable over the tool route with the same secret. If that is not what you want, run `MCP_HTTP_TOOLS=false`
+- A watcher rule is an outbound HTTP call the router makes on its own. Treat `watch_rules.json` as credential material — it can carry bot tokens and internal URLs. It is in `.gitignore`; prefer `$NAME` placeholders resolved from `.env`
+- Rule matches are logged to syslog by rule id, never with the matched line, so a message body does not end up in the router log
 - Never commit `.env` — it is in `.gitignore`
 - Change the default SSH password after installation
 
 ## Changelog
 
+- **2.7.0** — the universal watcher, 42 -> 44 tools. A background thread polls the router locally and makes an outbound HTTP call when a rule matches, turning "ask the router every minute" into "the router tells you in ten seconds". Two event sources: log lines by regex, and appear/disappear/change diffs on any RCI branch. Rules are one JSON file on the router, re-read on mtime change, with a `defaults` block that keeps a working rule to three or four lines; substitution is `string.Template.safe_substitute`, no templating engine involved. Nothing in the code knows what a receiver is — a webhook, ntfy and the Telegram Bot API are the same thing to it. Log position is tracked by line content rather than by the log's own numbering, because that numbering restarts on reboot and pre-NTP timestamps are wrong; when the position is lost the current tail becomes the baseline and nothing is reported. New tools `get_watch_status` and `test_watch_rule`. `core.rci_lock` now serialises the shared session cookie between the watcher thread, the backup thread and the HTTP server
 - **2.6.0** — plain-HTTP access to the tools, for clients that cannot speak MCP. `GET /<MCP_SECRET>/tool/<name>?arg=value` runs any tool and answers JSON (`&raw=1` for the tool's own text); `GET /<MCP_SECRET>/tools` lists what is servable. **Read-only by default:** the 13 state-changing tools return 403 unless named in the new `MCP_HTTP_TOOL_ALLOWLIST`; `MCP_HTTP_TOOLS=false` disables the route entirely. Arguments are coerced from each tool's declared `inputSchema`, so a bad type is an explicit 400 rather than a silently wrong call. The policy lives in a new `http_tools.py` — the registry and tool modules are untouched. Also fixes two `get_log` papercuts: lines with no parsable timestamp are no longer dropped from a `since`/`until` window, and output is flagged when it contains entries stamped before the current boot (pre-NTP clock)
 - **2.5.0** — modular refactor + configurable protection, 40 -> 42 tools. `server.py` is split into focused modules (`core`, `backup`, `helpers`, `tools_network`, `tools_system`, `tools_config`, `registry`, and a thin `server`) with identical behaviour. The write-tool protection list moves from hardcoded to `.env` (`MCP_PROTECTED_PORTS` / `MCP_PROTECTED_PROXY_NAMES` / `MCP_PROTECTED_UPSTREAMS`); the server's own port, `127.0.0.1:<port>` upstream and `keenetic-mcp` name are always protected automatically. Two new read tools: `get_schedule` (router schedules, incl. the firmware auto-update window) and `get_dns_proxy` (upstream resolvers with DoT SNI + static records)
 - **2.4.0** — write tools, 34 -> 40: `set_port_forwarding` / `remove_port_forwarding`, `set_keendns_mapping` / `remove_keendns_mapping`, `set_dhcp_host` / `remove_dhcp_host`, all with `dry_run` defaulting to true, a coded protected list, `system configuration save` after every write and a before/after verification read. `rci_query` gained `config_tree` for read-only inspection of settings branches

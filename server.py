@@ -17,6 +17,7 @@ from backup import syslog, backup_scheduler
 from tools_system import dump_log_to_nas, tool_reboot
 from registry import TOOLS, call_tool
 import http_tools
+import watcher
 
 
 class MCPHandler(http.server.BaseHTTPRequestHandler):
@@ -152,6 +153,11 @@ if __name__ == "__main__":
                   ", mutating allowed: " + ", ".join(extra) if extra else ""))
     else:
         syslog("INFO: HTTP tool route disabled (MCP_HTTP_TOOLS=false)")
+
+    try:
+        syslog("INFO: " + watcher.start())
+    except Exception as e:
+        syslog(f"ERROR: watcher failed to start: {e}")
 
     print(f"Starting Keenetic MCP v{VERSION} on port {core.PORT}")
     server = http.server.HTTPServer(("0.0.0.0", core.PORT), MCPHandler)

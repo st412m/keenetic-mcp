@@ -54,14 +54,17 @@ def cron_matches(schedule, now):
 
 
 def fetch_running_config():
-    auth()
-    req = urllib.request.Request(
-        f"{core.HOST}/rci/show/running-config",
-        headers={"Cookie": core.session_cookie or ""},
-        method="GET"
-    )
-    resp = urllib.request.urlopen(req, timeout=15)
-    data = resp.read().decode()
+    # Under core.rci_lock: this reads core.session_cookie right after auth(),
+    # and since 2.7.0 the watcher thread can be re-authenticating in parallel.
+    with core.rci_lock:
+        auth()
+        req = urllib.request.Request(
+            f"{core.HOST}/rci/show/running-config",
+            headers={"Cookie": core.session_cookie or ""},
+            method="GET"
+        )
+        resp = urllib.request.urlopen(req, timeout=15)
+        data = resp.read().decode()
     if not data or len(data) < 100:
         raise ValueError(f"Config response too short: {len(data)} bytes")
     return data

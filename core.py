@@ -15,7 +15,7 @@ USER = "admin"
 PASS = "password"
 SECRET = "changeme"
 PORT = 9584
-VERSION = "2.6.0"
+VERSION = "2.7.0"
 
 # Backup config
 BACKUP_ENABLED = False
@@ -28,6 +28,13 @@ BACKUP_RSYNC_KEY = ""
 BACKUP_RSYNC_PATH = ""
 
 session_cookie = None
+
+# One RCI conversation at a time. Until 2.7.0 there was effectively a single
+# caller and the shared session_cookie was safe by accident; the watcher thread
+# now polls the router while the HTTP server may be serving a request. Two
+# threads re-authenticating at once would overwrite each other's cookie and one
+# of them would get a 401 it did not deserve. RLock, because rci() calls auth().
+rci_lock = threading.RLock()
 
 # Objects the write tools must never touch. Populated in load_env() from the
 # MCP_PROTECTED_* env vars, plus automatic self-protection (own port /
@@ -44,6 +51,14 @@ PROTECTED_UPSTREAMS = set()
 HTTP_TOOLS_ENABLED = True
 HTTP_TOOL_ALLOWLIST = set()
 
+# Watcher: a background thread polls the router locally and makes an outbound
+# HTTP call when a rule matches. Rules live in a JSON file on the router; see
+# watcher.py. Disabled in effect when the rules file is absent.
+WATCH_ENABLED = True
+WATCH_RULES = "watch_rules.json"
+WATCH_STATE = "/tmp/keenetic-mcp-watch.json"
+WATCH_INTERVAL = 10
+
 
 def _csv(value):
     return [x.strip() for x in str(value or "").split(",") if x.strip()]
@@ -55,6 +70,7 @@ def load_env():
     global BACKUP_RSYNC_HOST, BACKUP_RSYNC_USER, BACKUP_RSYNC_KEY, BACKUP_RSYNC_PATH
     global PROTECTED_PORTS, PROTECTED_PROXY_NAMES, PROTECTED_UPSTREAMS
     global HTTP_TOOLS_ENABLED, HTTP_TOOL_ALLOWLIST
+    global WATCH_ENABLED, WATCH_RULES, WATCH_STATE, WATCH_INTERVAL
 
     env_file = os.path.join(os.path.dirname(__file__), ".env")
     if os.path.exists(env_file):
@@ -108,8 +124,21 @@ def load_env():
     # Empty (the default) means: every read-only tool, no mutating ones.
     HTTP_TOOL_ALLOWLIST = set(_csv(os.environ.get("MCP_HTTP_TOOL_ALLOWLIST", "")))
 
+    WATCH_ENABLED = os.environ.get("MCP_WATCH", "true").lower() == "true"
+    WATCH_RULES = os.environ.get("MCP_WATCH_RULES", WATCH_RULES)
+    WATCH_STATE = os.environ.get("MCP_WATCH_STATE", WATCH_STATE)
+    try:
+        WATCH_INTERVAL = max(2, int(os.environ.get("MCP_WATCH_INTERVAL", str(WATCH_INTERVAL))))
+    except ValueError:
+        pass
+
 
 def auth():
+    with rci_lock:
+        return _auth_locked()
+
+
+def _auth_locked():
     global session_cookie
     req = urllib.request.Request(f"{HOST}/auth")
     try:
@@ -138,6 +167,11 @@ def auth():
 
 
 def rci(commands, timeout=10):
+    with rci_lock:
+        return _rci_locked(commands, timeout)
+
+
+def _rci_locked(commands, timeout=10):
     global session_cookie
     if not session_cookie:
         auth()
@@ -208,6 +242,11 @@ def _rci_node(ip, commands, timeout=15):
 def _rci_get(path, timeout=15):
     """GET /rci/<path>. Read-only by construction: there is no request body
     here, and writing to RCI requires a POST with one."""
+    with rci_lock:
+        return _rci_get_locked(path, timeout)
+
+
+def _rci_get_locked(path, timeout=15):
     global session_cookie
     if not session_cookie:
         auth()

@@ -3,3 +3,4 @@
 *.pid
 __pycache__/
 *.pyc
+watch_rules.json
