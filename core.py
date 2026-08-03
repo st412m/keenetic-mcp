@@ -15,7 +15,7 @@ USER = "admin"
 PASS = "password"
 SECRET = "changeme"
 PORT = 9584
-VERSION = "2.7.0"
+VERSION = "2.7.1"
 
 # Backup config
 BACKUP_ENABLED = False
@@ -34,6 +34,16 @@ session_cookie = None
 # now polls the router while the HTTP server may be serving a request. Two
 # threads re-authenticating at once would overwrite each other's cookie and one
 # of them would get a 401 it did not deserve. RLock, because rci() calls auth().
+#
+# 2.7.1: the watcher no longer takes this lock. It authenticates as its own
+# client and keeps its own cookie behind its own private lock, so it never
+# touches session_cookie and has nothing to serialise with. The lock was
+# correct but the contention was brutal - 'show log' takes 6-7 s on a KN-1010
+# and the watcher polls it every 10 s, so a lock-sharing watcher held this two
+# thirds of the time and any server request landing inside a poll waited it
+# out. See the header of watcher.py. The lock stays: it still guards the
+# server's own calls, and the guarantee is needed the moment a second caller
+# appears here.
 rci_lock = threading.RLock()
 
 # Objects the write tools must never touch. Populated in load_env() from the
@@ -44,7 +54,7 @@ PROTECTED_PORTS = set()
 PROTECTED_PROXY_NAMES = set()
 PROTECTED_UPSTREAMS = set()
 
-# Plain-HTTP tool route: GET /<SECRET>/tool/<name>?arg=value
+# Plain-HTTP tool route: GET /<SECRET>/tool/<n>?arg=value
 # Lets Home Assistant (rest_command / rest sensors / command_line) call tools
 # without speaking MCP. Read-only by default: tools that change router state
 # are refused unless named explicitly in MCP_HTTP_TOOL_ALLOWLIST.
@@ -54,6 +64,9 @@ HTTP_TOOL_ALLOWLIST = set()
 # Watcher: a background thread polls the router locally and makes an outbound
 # HTTP call when a rule matches. Rules live in a JSON file on the router; see
 # watcher.py. Disabled in effect when the rules file is absent.
+#
+# The watcher reads the router over its own RCI session against KEENETIC_HOST,
+# with the same credentials; there is nothing extra to configure for it.
 WATCH_ENABLED = True
 WATCH_RULES = "watch_rules.json"
 WATCH_STATE = "/tmp/keenetic-mcp-watch.json"

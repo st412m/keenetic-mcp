@@ -51,8 +51,36 @@ RAM. Writing it to the USB stick is not an option - that is the one thing this
 project does not do. The cost is that a router reboot resets the baseline:
 after a reboot the current picture becomes "normal" and only changes from that
 moment are reported. A restart of the server alone keeps its state.
+
+Why the watcher has its own RCI session (2.7.1 - read before touching it)
+------------------------------------------------------------------------
+2.7.0 had the watcher call core.rci()/core._rci_get(), which serialise on
+core.rci_lock. That lock exists for one reason: core keeps a single shared
+session_cookie, and two threads re-authenticating at once would overwrite each
+other's cookie. The lock was correct and the contention was brutal. 'show log'
+takes six to seven seconds on a KN-1010 and the watcher polls it every ten, so
+a lock-sharing watcher held core.rci_lock roughly two thirds of the time, and
+every MCP call and plain-HTTP tool call that landed inside a poll waited it
+out. Measured 2026-08-03: get_system_info answers in ~50 ms when the lock is
+free and took 6-7 s on about half the attempts; get_log itself took 15-20 s.
+
+The fix is not to poll less often and not to sneak past authentication. It is
+to stop sharing the thing the lock protects: the watcher authenticates as its
+own client, keeps its own cookie, and guards it with its own private lock that
+nothing outside this module ever takes. The router is happy to hold several
+concurrent RCI sessions - the web UI and the Home Assistant integration
+already do exactly that - and 'show log' is I/O, so the GIL is released while
+it runs and the HTTP server keeps answering throughout.
+
+Two consequences worth knowing. The watcher's login shows up in the router log
+as one more 'Core::Authenticator: user "admin" authenticated ... tag "cli"'
+line at startup, and again whenever the session is renewed after a 401; a rule
+that matches authentication lines will see them. And core.rci_lock is now
+taken only by the server's own calls - it stays because the guarantee it gives
+is still needed the moment a second caller appears in core.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -172,6 +200,180 @@ def _save_state():
         os.replace(tmp, state_path())
     except Exception as e:
         syslog("WARNING: watcher could not save state: %s" % e)
+
+
+# --- secret masking ---------------------------------------------------------
+#
+# test_watch_rule renders a rule's outbound call so it can be inspected. What
+# it renders contains, by design, everything needed to make that call - which
+# for a Telegram rule means the bot token in the URL and the proxy password in
+# the proxy URL. Until 2.7.1 both came back in clear text, and the tool is
+# reachable over the plain-HTTP route as well, i.e. behind nothing but a path
+# secret. The rendered view is for checking shape, not for reading credentials
+# back out, so the credentials are replaced with *** on the way out.
+#
+# Two independent passes, because either alone leaves a hole. Values from the
+# environment are masked by value: those are exactly the strings the rule
+# loader substituted in, so they are caught wherever they ended up, including
+# inside a body. Patterns catch what was written literally into the rules file
+# and never passed through the environment at all.
+
+SECRET_ENV_RE = re.compile(
+    r"(TOKEN|SECRET|PASS|PASSWD|PASSWORD|KEY|AUTH|CRED|PROXY)", re.I)
+
+SECRET_HEADERS = {
+    "authorization", "proxy-authorization", "cookie", "set-cookie",
+    "x-api-key", "x-auth-token", "x-access-token",
+}
+
+MASK = "***"
+MIN_SECRET_LEN = 6
+
+MASK_PATTERNS = [
+    # Telegram bot token in a path: /bot<digits>:<token>
+    (re.compile(r"(/bot)\d{5,}:[A-Za-z0-9_\-]{10,}"), r"\1" + MASK),
+    # user:password@host in any URL, including a proxy URL
+    (re.compile(r"([A-Za-z][A-Za-z0-9+.\-]*://)[^/@\s]+:[^/@\s]+@"),
+     r"\1" + MASK + ":" + MASK + "@"),
+    # token=..., "api_key": "...", password: ...
+    (re.compile(r"((?:token|api[_-]?key|apikey|access[_-]?token|secret|"
+                r"password|passwd|auth)[\"']?\s*[:=]\s*[\"']?)"
+                r"([^\"'\s,&}]{%d,})" % MIN_SECRET_LEN, re.I), r"\1" + MASK),
+]
+
+
+def _secret_values():
+    """Environment values that must never be echoed back.
+
+    Only UPPERCASE names, matching the same namespace the rule loader
+    substitutes from, and only names that look like a credential - masking
+    every environment value would blank out ordinary text such as a host name.
+    A proxy URL contributes its own user and password separately, so that they
+    are still masked if a rule spelled them out itself.
+    """
+    out = []
+    for name, value in os.environ.items():
+        if not name.isupper() or not value or len(value) < MIN_SECRET_LEN:
+            continue
+        if not SECRET_ENV_RE.search(name):
+            continue
+        out.append(value)
+        m = re.match(r"^[A-Za-z][A-Za-z0-9+.\-]*://([^/@\s:]+):([^/@\s]+)@", value)
+        if m:
+            out.extend(p for p in m.groups() if p and len(p) >= MIN_SECRET_LEN)
+    # Longest first: a short secret contained in a longer one must not chop it
+    # in half and leave the tail readable.
+    return sorted(set(out), key=len, reverse=True)
+
+
+def mask_secrets(text, values=None):
+    if text is None:
+        return None
+    text = str(text)
+    for value in (values if values is not None else _secret_values()):
+        if value and value in text:
+            text = text.replace(value, MASK)
+    for pat, repl in MASK_PATTERNS:
+        text = pat.sub(repl, text)
+    return text
+
+
+def mask_headers(headers, values=None):
+    out = {}
+    for name, value in (headers or {}).items():
+        if str(name).lower() in SECRET_HEADERS:
+            out[name] = MASK
+        else:
+            out[name] = mask_secrets(value, values)
+    return out
+
+
+# --- the watcher's own RCI session ------------------------------------------
+#
+# Deliberately a copy of core's challenge-response rather than a call into it:
+# the whole point is that this cookie is not core's cookie and this lock is not
+# core.rci_lock. Sharing either would bring back exactly the contention this
+# replaced. The scheme itself is the router's and does not change:
+#   GET /auth -> 401 + X-NDM-Realm + X-NDM-Challenge + Set-Cookie
+#   md5(login:realm:password) -> sha256(challenge + md5)
+#   POST /auth {"login": ..., "password": sha256}
+
+_sess = {"cookie": None, "logins": 0, "since": None, "last_error": None}
+_sess_lock = threading.RLock()
+
+
+def _session_auth():
+    """Log in with our own cookie. Returns True on success."""
+    try:
+        urllib.request.urlopen(urllib.request.Request("%s/auth" % core.HOST),
+                               timeout=LOG_FETCH_TIMEOUT)
+    except urllib.error.HTTPError as e:
+        if e.code != 401:
+            raise
+        realm = e.headers.get("X-NDM-Realm", "")
+        challenge = e.headers.get("X-NDM-Challenge", "")
+        cookie_header = e.headers.get("Set-Cookie", "")
+        cookie = cookie_header.split(";")[0] if cookie_header else ""
+        md5_pass = hashlib.md5(
+            ("%s:%s:%s" % (core.USER, realm, core.PASS)).encode()).hexdigest()
+        sha = hashlib.sha256(("%s%s" % (challenge, md5_pass)).encode()).hexdigest()
+        payload = json.dumps({"login": core.USER, "password": sha}).encode()
+        resp = urllib.request.urlopen(urllib.request.Request(
+            "%s/auth" % core.HOST,
+            data=payload,
+            headers={"Content-Type": "application/json", "Cookie": cookie},
+            method="POST",
+        ), timeout=LOG_FETCH_TIMEOUT)
+        cookie2 = resp.headers.get("Set-Cookie", "")
+        if cookie2:
+            cookie = cookie2.split(";")[0]
+        _sess["cookie"] = cookie
+        _sess["logins"] += 1
+        _sess["since"] = _now_str()
+        _sess["last_error"] = None
+        return True
+    # No 401 at all means the router is not asking us to authenticate; carry on
+    # with whatever cookie we have rather than inventing an error.
+    return False
+
+
+def _session_get(path, timeout):
+    """GET /rci/<path> on our own session, one retry after a 401."""
+    if not _sess["cookie"]:
+        _session_auth()
+
+    def do_request():
+        req = urllib.request.Request(
+            "%s/rci/%s" % (core.HOST, str(path).strip("/")),
+            headers={"Cookie": _sess["cookie"] or ""},
+            method="GET",
+        )
+        # No proxy, ever: this process carries proxy settings in its
+        # environment for the outbound side of the rules, and a request to the
+        # router that went out through a VPS would be an interesting bug to
+        # find later.
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        return opener.open(req, timeout=timeout)
+
+    try:
+        resp = do_request()
+    except urllib.error.HTTPError as e:
+        if e.code != 401:
+            raise
+        _sess["cookie"] = None
+        _session_auth()
+        resp = do_request()
+    return resp.read().decode("utf-8", "replace")
+
+
+def fetch_rci(path, timeout=LOG_FETCH_TIMEOUT):
+    """Read /rci/<path> as parsed JSON. Takes the watcher's lock, never core's."""
+    with _sess_lock:
+        try:
+            return json.loads(_session_get(path, timeout))
+        except Exception as e:
+            _sess["last_error"] = "%s %s: %s" % (_now_str(), type(e).__name__, e)
+            raise
 
 
 # --- rules ------------------------------------------------------------------
@@ -353,12 +555,15 @@ def send(rule, mapping):
             detail = e.read(200).decode("utf-8", "replace").strip()
         except Exception:
             pass
-        return False, "HTTP %s %s" % (e.code, detail)
+        return False, "HTTP %s %s" % (e.code, mask_secrets(detail))
     except Exception as e:
         hint = ""
         if "SSL" in type(e).__name__ or "certificate" in str(e).lower():
             hint = " (https from the router needs ca-certificates; or set \"verify_ssl\": false)"
-        return False, "%s: %s%s" % (type(e).__name__, e, hint)
+        # An exception from urllib often quotes the URL it was opening, and that
+        # URL carries the token. Errors are stored in get_watch_status and end
+        # up in syslog, so they get the same treatment as a rendered request.
+        return False, "%s: %s%s" % (type(e).__name__, mask_secrets(e), hint)
 
 
 def _cooldown_ok(rule, event_key):
@@ -429,6 +634,29 @@ def _log_fields(line):
     return out
 
 
+def _log_dict(data):
+    """Log entries as {key: entry}, whatever shape RCI wrapped them in.
+
+    POST /rci/ with {"show": {"log": {}}} answers {"show": {"log": ...}};
+    GET /rci/show/log answers the inner node on its own, and either form may
+    put the entries in a list rather than a numbered dict. All four are the
+    same log.
+    """
+    if isinstance(data, list):
+        return {str(i): v for i, v in enumerate(data)}
+    if not isinstance(data, dict):
+        return {}
+    if "show" in data:
+        node = _parse_log_dict(data)
+    elif "log" in data:
+        node = data["log"]
+    else:
+        node = data
+    if isinstance(node, list):
+        return {str(i): v for i, v in enumerate(node)}
+    return node if isinstance(node, dict) else {}
+
+
 def _find_new(hashes, anchor):
     """Index of the first unseen line, or None when our place is lost.
 
@@ -448,8 +676,7 @@ def _find_new(hashes, anchor):
 
 
 def poll_log(rules):
-    result = core.rci({"show": {"log": {}}}, timeout=LOG_FETCH_TIMEOUT)
-    log_dict = _parse_log_dict(result)
+    log_dict = _log_dict(fetch_rci("show/log", LOG_FETCH_TIMEOUT))
     if not isinstance(log_dict, dict):
         return
     keys = sorted(log_dict.keys(), key=lambda x: int(x) if str(x).isdigit() else 0)
@@ -562,8 +789,7 @@ def _track_hash(flat, rule):
 
 
 def poll_rci(path, rules):
-    raw = core._rci_get(path, timeout=LOG_FETCH_TIMEOUT)
-    data = json.loads(raw)
+    data = fetch_rci(path, LOG_FETCH_TIMEOUT)
 
     for rule in rules:
         items = _extract_items(data, rule.get("items"))
@@ -639,6 +865,17 @@ def _plan(rules):
 def watcher_loop():
     time.sleep(START_DELAY)
     _load_state()
+    try:
+        with _sess_lock:
+            _session_auth()
+        syslog("INFO: watcher opened its own RCI session on %s (core.rci_lock "
+               "is not taken by the watcher)" % core.HOST)
+    except Exception as e:
+        # Not fatal: the first poll will try again. Worth a line, because a
+        # watcher that cannot log in will look like a watcher with no events.
+        _sess["last_error"] = "%s %s: %s" % (_now_str(), type(e).__name__, e)
+        syslog("WARNING: watcher could not open its RCI session yet: %s: %s"
+               % (type(e).__name__, e))
     with _lock:
         _stats["started"] = _now_str()
     syslog("INFO: watcher started")
@@ -660,14 +897,16 @@ def watcher_loop():
                 except Exception as e:
                     with _lock:
                         _stats["last_error"] = "%s %s: %s: %s" % (
-                            _now_str(), src_key, type(e).__name__, e)
-                    syslog("ERROR: watcher poll %s: %s: %s" % (src_key, type(e).__name__, e))
+                            _now_str(), src_key, type(e).__name__, mask_secrets(e))
+                    syslog("ERROR: watcher poll %s: %s: %s"
+                           % (src_key, type(e).__name__, mask_secrets(e)))
             with _lock:
                 _stats["last_cycle"] = _now_str()
         except Exception as e:
             with _lock:
-                _stats["last_error"] = "%s cycle: %s: %s" % (_now_str(), type(e).__name__, e)
-            syslog("ERROR: watcher cycle: %s: %s" % (type(e).__name__, e))
+                _stats["last_error"] = "%s cycle: %s: %s" % (
+                    _now_str(), type(e).__name__, mask_secrets(e))
+            syslog("ERROR: watcher cycle: %s: %s" % (type(e).__name__, mask_secrets(e)))
         time.sleep(1)
 
 
@@ -709,6 +948,16 @@ def tool_get_watch_status(args):
             "rules_error": _stats["rules_error"],
             "state_file": state_path(),
             "poll_interval_default": core.WATCH_INTERVAL,
+            # The watcher's own RCI session. session_active false with a
+            # session_error set means polls are failing to log in, which looks
+            # from the outside exactly like "no events happened".
+            "rci_session": {
+                "own_session": True,
+                "active": bool(_sess["cookie"]),
+                "logins": _sess["logins"],
+                "since": _sess["since"],
+                "last_error": _sess["last_error"],
+            },
             "log_anchor": len(_state["log"].get("anchor") or []),
             "rules": [],
         }
@@ -763,22 +1012,26 @@ def tool_test_watch_rule(args):
     mapping["message"] = _subst(str(rule.get("message", "watcher test: ${rule}")), mapping)
 
     method, url, headers, data = build_request(rule, mapping)
+    # The real call below is made from the unmasked values; only what is
+    # reported back is masked.
+    secrets = _secret_values()
     out = {
         "rule": rule["id"],
         "dry_run": bool(dry_run),
         "request": {
             "method": method,
-            "url": url,
-            "headers": headers,
-            "body": data.decode("utf-8", "replace") if data else None,
-            "proxy": rule.get("proxy"),
+            "url": mask_secrets(url, secrets),
+            "headers": mask_headers(headers, secrets),
+            "body": mask_secrets(data.decode("utf-8", "replace"), secrets) if data else None,
+            "proxy": mask_secrets(rule.get("proxy"), secrets),
         },
-        "message": mapping["message"],
+        "secrets_masked": True,
+        "message": mask_secrets(mapping["message"], secrets),
     }
     if not dry_run:
         ok, detail = send(rule, mapping)
         out["sent"] = ok
-        out["result"] = detail
+        out["result"] = mask_secrets(detail, secrets)
     return json.dumps(out, indent=2, ensure_ascii=False)
 
 
@@ -786,10 +1039,10 @@ WATCH_TOOLS = {
     "get_watch_status": {
         "description": (
             "Watcher status: whether the background event watcher is running, which "
-            "rules file it read, and per rule - source, poll interval, cooldown, "
-            "seconds to the next poll, match/sent/failed counters and the last "
-            "delivery error. Use it to check that a rule is alive without waiting "
-            "for the event it watches for."
+            "rules file it read, the state of its own RCI session, and per rule - "
+            "source, poll interval, cooldown, seconds to the next poll, "
+            "match/sent/failed counters and the last delivery error. Use it to check "
+            "that a rule is alive without waiting for the event it watches for."
         ),
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_watch_status,
@@ -798,9 +1051,10 @@ WATCH_TOOLS = {
         "description": (
             "Render a watcher rule's outbound HTTP call with sample event values, so "
             "the URL, headers and body can be inspected before a real event fires. "
-            "dry_run is TRUE by default and sends nothing; dry_run=false performs the "
-            "call for real, which is how to prove the receiver is reachable from the "
-            "router."
+            "Credentials in the rendered view are masked; the call itself, when sent, "
+            "uses the real values. dry_run is TRUE by default and sends nothing; "
+            "dry_run=false performs the call for real, which is how to prove the "
+            "receiver is reachable from the router."
         ),
         "inputSchema": {"type": "object", "properties": {
             "rule_id": {"type": "string", "description": "Rule id from the rules file"},
