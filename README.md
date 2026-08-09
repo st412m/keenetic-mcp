@@ -289,7 +289,27 @@ A rule inherits everything it does not set from `defaults`, which is what keeps 
 
 **`source: "log"`** — `match` is a regex against the formatted log line; `exclude` is an optional counter-regex. Capture groups arrive as `${m1}`…`${m9}`, named groups under their own names, plus `${line}`, `${text}`, `${label}`, `${ident}`, `${log_time}`. Cooldown for a log rule is **per rule**: one login writes several lines, and the useful limit is "at most once every N seconds", not "once per distinct wording".
 
-Check that the event you want is actually written before building a rule on it. On KeeneticOS 5.1.1 a web-configurator login is **not logged at all** — not a successful one, not a failed one, not under `Core::Authenticator`, not by nginx (which only logs errors). Verified by logging in three times, once with a deliberately wrong password, while the log kept recording DHCP, Wi-Fi and IPsec events in the same minutes. What *is* logged: `Vpn::EventSender: ... connected from` for remote access, with user and source IP, and `Core::System::StartupConfig: saving (http/rci)` when settings are saved — the latter fires for this server's own write tools too, since the log does not say who asked. Beware also of `Core::Authenticator: user "admin" tagged with "http"`: that is the config being replayed at boot, so a rule matching `tag "http"` alone fires on every reboot.
+Check that the event you want is actually written before building a rule on it — and check whether the firmware has to be told to write it. **Authentication logging is off by default on KeeneticOS 5.1.1.** Turn it on once and it survives reboots:
+
+```
+ip http log auth
+system configuration save
+```
+
+From an Entware shell the same two commands go through `ndmc -c '...'`, run under a normal ssh login — not under `exec sh`, which fails with `ndmc: system failed [0xcffd0060]`. Typing `ip http log auth` directly in an Entware shell hits busybox `ip`, not the router CLI.
+
+With it on, the router logs both halves of a web-configurator login, with the source address:
+
+```
+Core::Scgi::Auth::Handler: opened session for user "admin" from "192.168.1.41".
+Core::Scgi::Auth::Handler: authentication failed for user "admin" from "192.168.1.41".
+```
+
+Two authentication channels write under different prefixes, which is worth knowing before writing a regex. `Core::Scgi::Auth::Handler` covers the web configurator **and RCI**, so this server's own logins land there too, from the router's own LAN address. `Core::Authenticator: user "admin" authenticated ... tag "cli"` is the telnet/SSH channel and is written whether or not `log auth` is on. Brute-force bans need no switch at all: `Netfilter::Util::BfdManager: "Http": ban remote host <IP> for 15 minutes`, with a matching unban.
+
+Earlier versions of this file said a web-configurator login was not logged at all, on 5.1.1, ever. That was wrong — the switch was simply off. The format also differs from Keenetic's own documentation, which shows a session id in the `opened session` line; on 5.1.1 there is none. Match the string your own log actually contains.
+
+Logged without any switch: `Vpn::EventSender: ... connected from` for remote access, with user and source IP, and `Core::System::StartupConfig: saving (http/rci)` when settings are saved — the latter fires for this server's own write tools too, since the log does not say who asked, while a change made through `ndmc` writes `saving (cli)` instead. Beware also of `Core::Authenticator: user "admin" tagged with "http"`: that is the config being replayed at boot, so a rule matching `tag "http"` alone fires on every reboot.
 
 **`source: "rci"`** — `path` is an RCI path (`show/ip/hotspot`), `key` is the field identifying an item (`mac`), `where` / `where_not` select which items count, `on` is any of `appear` (default), `disappear`, `change`, and `change` compares the fields in `track`. Every field of the matched item is a placeholder, nested ones flattened with underscores (`${interface_name}`) and also exposed under their short name when nothing else claims it (`${ap}` for `mws_ap`). Cooldown here is **per item**.
 
@@ -306,7 +326,7 @@ Note that the proxy does not decrypt anything — `CONNECT` forwards bytes and T
 - **Position in the log is found by content, not by number.** The log is a RAM ring buffer: after a reboot the numbering restarts, and the lines written before NTP answers carry a date restored from flash that can be days off. Neither the index nor the timestamp can be trusted, so the watcher remembers the hashes of the last few lines and looks for them in the next poll. When it cannot find them — reboot, or a burst larger than the buffer — it adopts the current tail as the new baseline and reports nothing, rather than replaying a whole boot as news.
 - **The first sight of an RCI rule is a baseline, not an event.** Otherwise every restart would announce everything that is already there.
 - **State lives in `/tmp`** (`MCP_WATCH_STATE`), i.e. in RAM. Writing it to the USB stick is the one thing this project does not do. The cost is that a router reboot resets the baseline: a device that was already connected before the reboot becomes part of the new normal. A restart of the server alone keeps its state.
-- **The watcher has its own RCI session.** It authenticates as its own client and guards its own cookie with a private lock, so it never touches `core.rci_lock` and a poll cannot delay an MCP call. This is not how 2.7.0 worked: there the watcher shared the server's session, and since `show log` costs six to seven seconds on a KN-1010 against a ten-second poll, the lock was held about two thirds of the time. What a session cannot fix is the cost of `show log` itself — `get_log` still takes ten seconds or so, and still belongs nowhere near a polling loop. One visible side effect: the watcher's login writes its own `Core::Authenticator ... tag "cli"` line at startup and on session renewal
+- **The watcher has its own RCI session.** It authenticates as its own client and guards its own cookie with a private lock, so it never touches `core.rci_lock` and a poll cannot delay an MCP call. This is not how 2.7.0 worked: there the watcher shared the server's session, and since `show log` costs six to seven seconds on a KN-1010 against a ten-second poll, the lock was held about two thirds of the time. What a session cannot fix is the cost of `show log` itself — `get_log` still takes ten seconds or so, and still belongs nowhere near a polling loop. One visible side effect: the watcher authenticates over HTTP like any other RCI client, so with `ip http log auth` enabled its login appears as `Core::Scgi::Auth::Handler: opened session for user "admin" from "<the router's own LAN address>"` at startup and on session renewal — not under `Core::Authenticator`, which is the CLI/SSH channel. A rule matching web logins will see it, so exclude the router's own address unless you want to hear about it
 
 ### Checking it works
 

@@ -24,8 +24,8 @@ this module):
         {
           "id": "web_login",
           "source": "log",
-          "match": "Core::Authenticator.*authenticated.*tag \\"http\\"",
-          "message": "Web login: ${line}"
+          "match": "Scgi::Auth::Handler: opened session for user \\"([^\\"]+)\\" from \\"([^\\"]+)\\"",
+          "message": "Web login: ${m1} from ${m2}"
         },
         {
           "id": "unknown_device",
@@ -72,10 +72,15 @@ concurrent RCI sessions - the web UI and the Home Assistant integration
 already do exactly that - and 'show log' is I/O, so the GIL is released while
 it runs and the HTTP server keeps answering throughout.
 
-Two consequences worth knowing. The watcher's login shows up in the router log
-as one more 'Core::Authenticator: user "admin" authenticated ... tag "cli"'
-line at startup, and again whenever the session is renewed after a 401; a rule
-that matches authentication lines will see them. And core.rci_lock is now
+Two consequences worth knowing. The watcher authenticates over HTTP like any
+other RCI client, so - once 'ip http log auth' is enabled, which it is not by
+default - its login shows up in the router log as
+'Core::Scgi::Auth::Handler: opened session for user "admin" from "<router's own
+LAN address>"' at startup, and again whenever the session is renewed after a
+401. That is the same line a human logging into the web configurator produces,
+so a rule watching for logins will see the watcher too; use 'exclude' on the
+router's own address if you only care about everyone else. It does not write
+'Core::Authenticator', which is the telnet/SSH channel. And core.rci_lock is now
 taken only by the server's own calls - it stays because the guarantee it gives
 is still needed the moment a second caller appears in core.
 """

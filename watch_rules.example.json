@@ -1,6 +1,5 @@
 {
   "_comment": "Copy to watch_rules.json next to server.py and edit. The real file is gitignored. Everything a rule does not set is taken from 'defaults', so a working rule is three or four lines. Placeholders are ${name}; an unknown one is left in the text as-is, so a typo is visible instead of silently empty. An UPPERCASE $NAME in url, headers, proxy or body is expanded from the environment (.env) when the file is loaded - keep tokens, chat ids and proxy passwords there, not here. If every receiver needs the same proxy, move it into 'defaults'; if some receivers are on the LAN, keep it per rule.",
-
   "defaults": {
     "method": "POST",
     "url": "http://192.168.1.54:8123/api/webhook/keenetic_watch",
@@ -12,36 +11,60 @@
     "cooldown": 60,
     "timeout": 10
   },
-
   "rules": [
     {
-      "_comment": "Remote access into the home network. Unlike a web-configurator login, which KeeneticOS 5.1.1 does not log at all, this event carries the user, the source IP and the address handed out.",
+      "_comment": "Remote access into the home network: the event carries the user, the source IP and the address handed out.",
       "id": "vpn_login",
       "source": "log",
       "match": "Vpn::EventSender: \"([^\"]+)\": user \"([^\"]+)\" connected from \"([^\"]+)\"",
       "message": "VPN-подключение к домашней сети: ${m2} (${m1}) с адреса ${m3}"
     },
-
     {
-      "_comment": "The only trace someone who knows the admin password leaves behind: settings were saved. Fires on this server's own write tools too - they save the same way and the log does not say who asked.",
+      "_comment": "Settings were saved. Fires on this server's own write tools too - they save the same way and the log does not say who asked. A change made from the router CLI or through ndmc writes 'saving (cli)' instead and is not matched here.",
       "id": "router_config_saved",
       "source": "log",
       "match": "StartupConfig: saving \\(http/rci\\)",
       "cooldown": 300,
       "message": "На роутере сохранена конфигурация (веб-конфигуратор или RCI)"
     },
-
+    {
+      "_comment": "Web-configurator and RCI logins. Requires authentication logging, which is OFF by default: run 'ip http log auth' then 'system configuration save' in the router CLI (from an Entware shell: ndmc -c '...'). 'exclude' drops this server's own logins - they come from the router's own LAN address - and any other client of your own; adjust the addresses to your network. Cooldown for a log rule is per rule, not per address, so keep it short: with a long one a stranger logging in right after you is swallowed silently.",
+      "id": "web_login",
+      "source": "log",
+      "match": "Scgi::Auth::Handler: opened session for user \"([^\"]+)\" from \"([^\"]+)\"",
+      "exclude": "from \"192\\.168\\.1\\.(1|54)\"",
+      "cooldown": 30,
+      "message": "Вход в веб-конфигуратор: пользователь ${m1} с адреса ${m2}"
+    },
+    {
+      "_comment": "Failed logins. Same switch as above; without it a wrong password looks exactly like nothing happening.",
+      "id": "web_login_failed",
+      "source": "log",
+      "match": "authentication failed for user \"([^\"]+)\" from \"([^\"]+)\"",
+      "cooldown": 60,
+      "message": "НЕУДАЧНАЯ попытка входа в веб-конфигуратор: пользователь ${m1} с адреса ${m2}"
+    },
+    {
+      "_comment": "Brute-force protection kicking in. Needs no switch - bans are logged by default. Stock policy is five attempts in three minutes and a fifteen-minute ban; see lockout-policy in the running config.",
+      "id": "bruteforce_ban",
+      "source": "log",
+      "match": "BfdManager: \"([^\"]+)\": ban remote host ([0-9.]+) for ([0-9]+) minutes",
+      "cooldown": 60,
+      "message": "Защита от перебора: адрес ${m2} заблокирован на ${m3} мин (служба ${m1})"
+    },
     {
       "id": "unknown_device",
       "source": "rci",
       "path": "show/ip/hotspot",
       "key": "mac",
-      "where": {"active": true, "registered": false},
+      "where": {
+        "active": true,
+        "registered": false
+      },
       "interval": 30,
       "cooldown": 900,
       "message": "Незнакомое устройство в сети: ${mac}, IP ${ip}, имя '${name}', hostname '${hostname}', сеть ${interface_name}"
     },
-
     {
       "_comment": "Straight to the Telegram Bot API instead of a webhook. api.telegram.org is unreachable directly from this router, so it goes through the same proxy Home Assistant uses. Put all three in .env: TG_TOKEN, TG_CHAT_ID and TG_PROXY=http://user:pass@host:port - the proxy demands authentication (a bare CONNECT gets 407). Only UPPERCASE names are read from the environment. Enable this or the webhook rule, not both.",
       "id": "vpn_login_telegram_direct",
