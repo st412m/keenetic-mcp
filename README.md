@@ -4,7 +4,7 @@ MCP (Model Context Protocol) server for Keenetic routers. Runs directly on the r
 
 Tested on: **Keenetic Giga KN-1010 + KN-1011 (Mesh)**, KeeneticOS **5.1.1** (`5.01.C.1.0-0`), Entware `mipselsf`.
 
-Current version: **2.7.2** — 44 tools, no dependencies outside the Python standard library. Tools are reachable over MCP and, since 2.6.0, over plain HTTP for clients that do not speak the protocol (Home Assistant, curl, shell scripts). Since 2.7.0 the server can also push: a background watcher polls the router locally and makes an outbound HTTP call when a rule matches.
+Current version: **2.7.3** — 45 tools, no dependencies outside the Python standard library. Tools are reachable over MCP and, since 2.6.0, over plain HTTP for clients that do not speak the protocol (Home Assistant, curl, shell scripts). Since 2.7.0 the server can also push: a background watcher polls the router locally and makes an outbound HTTP call when a rule matches.
 
 ## Available Tools
 
@@ -74,6 +74,7 @@ A protected object is refused outright; if you genuinely need to change one, do 
 
 ### Backups & management
 - `backup_config` — trigger a router config backup right now
+- `backup_mcp_config` — back up **this server's own** unversioned files (`.env`, `watch_rules.json`, the Entware init script) to the NAS. Runs synchronously and reports what happened — including a round-trip md5 check — rather than answering "started". See *Backing up the server's own configuration*
 - `list_backups` — list backup files already present on the NAS (`rsync --list-only`) — confirms the scheduled backups actually arrive
 - `dump_log` — snapshot the current router log and rsync it to the NAS backup path (RAM staging, no flash writes)
 - `reboot` — reboot the router
@@ -86,7 +87,7 @@ A protected object is refused outright; if you genuinely need to change one, do 
 As of 2.5.0 the server is split into flat modules in the repository root. This is a flat layout on purpose, not a Python package: `init.d` runs `python server.py` directly, so the script's directory is on `sys.path` and plain imports work with no change to how the addon starts.
 
 - `core.py` — `.env` loading, router authentication, the RCI client, and all mutable state (session cookie, protected-object sets)
-- `backup.py` — the config-backup scheduler and rsync
+- `backup.py` — the config-backup scheduler and rsync, plus (2.7.3) the backup of the server's own unversioned files
 - `helpers.py` — running-config parsing, secret masking, log formatting
 - `tools_network.py` — read tools for clients, WiFi, interfaces, logs, VPN, DNS proxy, mesh
 - `tools_system.py` — system info, client management, ping, media/opkg, reboot, schedules
@@ -137,6 +138,89 @@ cat /opt/etc/keenetic-backup-rsa.pub | ssh user@nas-host "mkdir -p ~/.ssh && cat
 
 You can trigger a backup manually at any time via `backup_config`, and verify that files really landed on the NAS via `list_backups`.
 
+### Backing up the server's own configuration
+
+A router config backup does not save this server. Three files here are restored by
+neither `git pull` nor the router's own backup:
+
+| File | Why git cannot restore it |
+|---|---|
+| `.env` | gitignored — it holds the router password and your tokens |
+| `watch_rules.json` | gitignored — the example file is the one under version control |
+| `/opt/etc/init.d/S99keenetic-mcp` | installed by hand; a pull of the working copy never touches the installed copy |
+
+Losing them means reconstructing the watcher's rules from memory, and the USB
+stick they live on is the least reliable part of the setup. Since **2.7.3** they
+ride along with the router config on the same schedule. It needs no
+configuration: with an rsync destination set, `BACKUP_MCP_CONFIG` defaults to
+true.
+
+```
+BACKUP_MCP_CONFIG=true
+BACKUP_MCP_INIT=/opt/etc/init.d/S99keenetic-mcp
+```
+
+**Layout on the receiver** — a mirror plus a dated snapshot:
+
+```
+<BACKUP_RSYNC_PATH>/
+├── keenetic-config-YYYY-MM-DD.json     the router config
+├── mcp-config/                         always current, rewritten every run
+│   ├── .env  watch_rules.json  S99keenetic-mcp  manifest.json
+└── mcp-config-YYYY-MM-DD/              written ONLY when the content changed
+```
+
+A directory per run would mean 52 a year for a set that changes perhaps four
+times; a single overwritten directory would keep no history at all, which is
+the one thing a backup is for. The hybrid keeps both properties: a corrupted
+file *is* a change, so it creates its own snapshot and the last good state stays
+in the previous one. **Nothing is ever deleted on the receiver** — there is no
+rotation, deliberately, because rotation means handing a delete primitive to the
+process whose whole job is preservation. If the snapshots ever do pile up,
+delete them yourself.
+
+**Change detection** compares `manifest.json` inside the mirror: md5 of each
+file, plus its true size, mode and mtime. No state file is written to the USB
+stick, and mtimes are not used to decide anything — a file restored by a plain
+`cp` carries the copy's mtime, not the original's, and an mtime comparison would
+then fire on identical content. The manifest is also what makes the backup
+self-describing: it says when each file was last edited even if the transport
+loses that.
+
+**Verification is part of the run, not an afterthought.** After sending, the
+mirror is read back off the receiver and md5-compared against what was staged;
+the result is the `verified` field. A backup tool that answers "started" is
+exactly how you come to believe in a backup that is not happening — so
+`backup_mcp_config` runs synchronously and returns:
+
+```json
+{
+  "ok": true,
+  "first_run": false,
+  "changed": false,
+  "mirror": "/share/backups/keenetic/mcp-config/",
+  "snapshot": null,
+  "verified": true,
+  "files": [
+    {"name": ".env", "size": 1251, "mode": "0600", "mtime": "2026-08-03 22:18:01"}
+  ],
+  "error": null
+}
+```
+
+Staging is in `/tmp` (tmpfs/RAM) — the flash drive is not written to. The whole
+set is a few kilobytes, so the run costs a second or two.
+
+Two things are deliberately **not** in the set. The rsync private key
+(`BACKUP_RSYNC_KEY`): it regenerates in a minute, and storing it on the share it
+unlocks buys nothing. And `running-config` itself, which has its own file.
+
+⚠️ The set contains credentials in clear text. Restrict the share to a single
+account. Note also that `.env` arrives as a dot-file: busybox `ls -l` does not
+list it, and Samba hides it from Windows Explorer by default (`hide dot files`),
+so it can look missing when it is not. Verify with `ls -la`, with
+`rsync --list-only`, or simply with `list_backups`.
+
 ## Plain HTTP endpoints
 
 Besides the MCP protocol (POST `/<MCP_SECRET>`), the server answers a few plain
@@ -165,11 +249,12 @@ parameter names, declared types and a `mutating` flag.
 
 **This route is read-only by default, and that is deliberate.** A secret in a
 URL is a weak credential: it lands in `configuration.yaml`, in automation
-traces, in shell history and in any proxy log along the way. So the 14 tools
+traces, in shell history and in any proxy log along the way. So the 15 tools
 that change state — all six write tools plus `reboot`, `register_client`,
-`update_client`, `block_client`, `unblock_client`, `backup_config`, `dump_log`
-and `test_watch_rule` — answer **403** here no matter what. The remaining 30
-read tools are served. To lift the gate for a specific tool, name it explicitly:
+`update_client`, `block_client`, `unblock_client`, `backup_config`,
+`backup_mcp_config`, `dump_log` and `test_watch_rule` — answer **403** here no
+matter what. The remaining 30 read tools are served. To lift the gate for a
+specific tool, name it explicitly:
 
     MCP_HTTP_TOOL_ALLOWLIST=register_client
 
@@ -315,7 +400,7 @@ Logged without any switch: `Vpn::EventSender: ... connected from` for remote acc
 
 **Substitution** is `string.Template.safe_substitute`: an unknown `${name}` is left in the text rather than raising or silently emptying, so a typo shows up in the message instead of disappearing. When `body` is an object it is sent as JSON and the escaping is done by the JSON encoder — which is why the Telegram example passes text through a JSON body and not a hand-built string.
 
-**Secrets:** `$NAME` in a `url`, a header, the `proxy` or the `body` is expanded from the environment when the file is loaded, so a bot token, a proxy password and a chat id can live in `.env` and stay out of the rules file. Only **UPPERCASE** names are taken from the environment; event fields are lowercase, so the two namespaces cannot collide and a stray `HOME` in the environment can never eat a `${message}`. `watch_rules.json` is gitignored either way.
+**Secrets:** `$NAME` in a `url`, a header, the `proxy` or the `body` is expanded from the environment when the file is loaded, so a bot token, a proxy password and a chat id can live in `.env` and stay out of the rules file. Only **UPPERCASE** names are taken from the environment; event fields are lowercase, so the two namespaces cannot collide and a stray `HOME` in the environment can never eat a `${message}`. `watch_rules.json` is gitignored either way — and, since 2.7.3, included in the backup of the server's own configuration, because gitignored also means unrecoverable.
 
 **`proxy`** is optional and per rule. Without it the call goes out directly — no proxy handler is even constructed, and there is no global proxy setting anywhere. It takes a full HTTP-proxy URL, credentials included (`http://user:pass@host:port`) — `urllib` sends `Proxy-Authorization` on the `CONNECT`, so an authenticated proxy works without any extra code. It has to be an HTTP proxy: SOCKS needs a library outside the standard library, and this project has no dependencies. Many SOCKS endpoints also speak HTTP on the same port — a mixed inbound does — so a proxy meant for something else is often reusable here. Use it when the router itself cannot reach the receiver: a bot API blocked upstream is exactly this case, and it is the difference between an alert that arrives when the rest of the house is down and one that does not. Put it in `defaults` only when *every* receiver needs it; a rule posting to a machine on the LAN must not inherit a proxy that sends the request abroad and back.
 
@@ -454,7 +539,8 @@ In Claude.ai go to Settings -> Integrations -> Add custom connector and paste th
 `.env` is in `.gitignore`, so a pull never touches your credentials. So is
 `watch_rules.json` — the example file is the one under version control. The
 autostart script itself is not updated by a pull of the working copy — after a
-release that changes it, copy it over again from `init.d/`.
+release that changes it, copy it over again from `init.d/`. All three are exactly
+what `backup_mcp_config` preserves, for the same reason.
 
 After adding or removing tools, **start a new chat** — MCP clients cache
 `tools/list` for the lifetime of a session, and toggling the connector inside an
@@ -525,9 +611,16 @@ attached; `test_watch_rule` with `dry_run=false` proves the receiver is
 reachable from the router, which is a different question from whether the event
 happened.
 
+**`backup_mcp_config` reports a file as skipped.** It warns to syslog and backs
+up what it found rather than failing the run. Usually the init script lives
+somewhere else — point `BACKUP_MCP_INIT` at it. `"error": "rsync target not
+configured"` means the `BACKUP_RSYNC_*` block is missing: the set has nowhere to
+go, and there is no local fallback for it by design, since the whole point is
+getting the files off this flash drive.
+
 ## Notes
 
-- All 44 tools tested on NDMS 5.1.1
+- All 45 tools tested on NDMS 5.1.1
 - `get_wifi` uses `show interface` (`show wireless` endpoint removed in NDMS 5.x)
 - `get_traffic` aggregates rx/tx from active clients and shows top 10 by usage
 - `get_channel_analysis` uses site survey data to recommend least congested channel
@@ -541,6 +634,8 @@ happened.
 - Port forwarding targets are addressed by **MAC**, not by IP (`ip static tcp GigabitEthernet1 8123 aa:bb:cc:dd:ee:ff`)
 - `disable` in an `ip static` rule is a **per-rule attribute**, not a global switch for the whole block. In `running-config` it is emitted as a separate `ip static disable` line that continues the *preceding* rule, which reads like a global directive and is not one — confirm with `rci_query path='ip/static' config_tree=true`, where the flag sits inside its own rule object
 - Backup scheduler runs in a background thread — no cron or external tools needed
+- The backup of the server's own configuration rides the same scheduled run, but its outcome does not change the router-config backup's result — a verification automation watching for `keenetic-config-*.json` must not start reporting failure because of a second, unrelated transfer
+- File copies for that backup use `shutil.copy2`, so the mirror carries the originals' mtime and mode rather than the moment of copying — the backup can then still say when a file was last edited
 - PID file, server log and watcher state live in `/tmp` (RAM) — no flash writes at runtime
 - The watcher runs in a second background thread alongside the backup scheduler. With no rules file it does not start at all and says so in syslog
 
@@ -554,6 +649,7 @@ happened.
 - The plain-HTTP tool route serves read-only tools only. State-changing tools are refused with 403 unless named in `MCP_HTTP_TOOL_ALLOWLIST` — treat adding one as handing out a write key, because the URL secret ends up in config files, automation traces and proxy logs
 - Anything reachable over MCP is reachable over the tool route with the same secret. If that is not what you want, run `MCP_HTTP_TOOLS=false`
 - A watcher rule is an outbound HTTP call the router makes on its own. Treat `watch_rules.json` as credential material — it can carry bot tokens and internal URLs. It is in `.gitignore`; prefer `$NAME` placeholders resolved from `.env`
+- `backup_mcp_config` copies `.env` and `watch_rules.json` to the backup destination in clear text. Restrict that share to one account, and note that the transfer does not go through the write tools' protection list — it is a file copy, not a router change. The rsync private key is excluded from the set on purpose: it is the key to the very share the backup sits on
 - `test_watch_rule` masks credentials in what it renders — bot tokens, proxy passwords, `Authorization` headers — by value against the environment and by pattern. Masking applies to the report, not to the call: `dry_run: false` sends the real thing, which is why the tool sits in the mutating set
 - Rule matches are logged to syslog by rule id, never with the matched line, so a message body does not end up in the router log
 - Never commit `.env` — it is in `.gitignore`
@@ -561,6 +657,7 @@ happened.
 
 ## Changelog
 
+- **2.7.3** — the server's own unversioned files are backed up too, 44 -> 45 tools. `.env`, `watch_rules.json` and the Entware init script are restored by neither `git pull` nor a router config backup — the first two are gitignored, the third is edited by hand — so until now they survived only as a manual copy someone had to remember to make. They now ride the same scheduled rsync run as `running-config`. Storage is a hybrid: a `mcp-config/` mirror rewritten every run, plus a dated `mcp-config-YYYY-MM-DD/` snapshot written **only when the content changed** — a directory per run would mean 52 a year for a set that changes about four times, and a single overwritten directory would keep no history at all. Change detection compares `manifest.json` inside the mirror on the receiver: no state file is written to the USB stick, and mtimes decide nothing, since a file restored with a plain `cp` carries the copy's mtime and would look changed forever. There is no rotation, deliberately — nothing here deletes anything on the receiver. The new `backup_mcp_config` tool runs synchronously and reports the outcome, including a round-trip md5 check of what actually landed, rather than answering "started"; it is in the mutating set, so the plain-HTTP route refuses it without an allowlist entry. Copies use `shutil.copy2`, so mtime and mode survive. The rsync private key is excluded: it regenerates in a minute, and storing it on the share it unlocks buys nothing
 - **2.7.2** — fixes log polling, which 2.7.1 broke: `GET /rci/show/log` answers 404, and the router's log exists only as the POST form `{"show": {"log": {}}}`. The watcher now keeps two clients on its single session — GET for RCI rules, POST for the log. Also keeps the proxy host and port readable when masking a rendered rule (`http://***:***@host:port`): which proxy a failed delivery went through is the thing you need to see, the password is not
 - **2.7.1** — the watcher stops sharing `core.rci_lock`, and `test_watch_rule` stops printing secrets. Measured on a KN-1010: `show log` costs six to seven seconds and the watcher polls it every ten, so under 2.7.0 the shared lock was held about two thirds of the time — a `get_system_info` that answers in 50 ms took 6–7 s on roughly half the attempts, 60 calls back to back took 33 s with 14 s and 7 s gaps, and `get_log` took 15–20 s. That lock only ever protected one shared `session_cookie`, so the watcher now authenticates as its own client and guards its own cookie with its own private lock; the router holds concurrent RCI sessions without complaint and `show log` is I/O, so the server keeps answering throughout. After: 60 calls in 4 s, no gaps. Separately, `test_watch_rule` rendered the bot token and the proxy password in clear text while being reachable over the plain-HTTP route — the rendered view is now masked by value (credential-looking `UPPERCASE` names from the environment) and by pattern, with `Authorization`-style headers blanked by name; the call itself still sends the real values. `get_watch_status` gains an `rci_session` block. ⚠️ Broken release — its log source returns 404; use 2.7.2
 - **2.7.0** — the universal watcher, 42 -> 44 tools. A background thread polls the router locally and makes an outbound HTTP call when a rule matches, turning "ask the router every minute" into "the router tells you in ten seconds". Two event sources: log lines by regex, and appear/disappear/change diffs on any RCI branch. Rules are one JSON file on the router, re-read on mtime change, with a `defaults` block that keeps a working rule to three or four lines; substitution is `string.Template.safe_substitute`, no templating engine involved. Nothing in the code knows what a receiver is — a webhook, ntfy and the Telegram Bot API are the same thing to it. Log position is tracked by line content rather than by the log's own numbering, because that numbering restarts on reboot and pre-NTP timestamps are wrong; when the position is lost the current tail becomes the baseline and nothing is reported. New tools `get_watch_status` and `test_watch_rule`. `core.rci_lock` now serialises the shared session cookie between the watcher thread, the backup thread and the HTTP server
