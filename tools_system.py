@@ -11,7 +11,7 @@ import time
 from datetime import datetime
 
 import core
-from backup import do_backup, rsync_to_remote, syslog
+from backup import backup_mcp_config, do_backup, rsync_to_remote, syslog
 from core import VERSION, _rci_get, rci
 from helpers import _rci_errors, _save_config
 from tools_network import tool_get_log
@@ -176,6 +176,19 @@ def tool_backup_config(args):
     threading.Thread(target=do_backup, daemon=True).start()
     dest = f"{core.BACKUP_RSYNC_USER}@{core.BACKUP_RSYNC_HOST}:{core.BACKUP_RSYNC_PATH}" if core.BACKUP_RSYNC_HOST else core.BACKUP_PATH
     return f"Backup started. Config will be saved to: {dest}"
+
+
+def tool_backup_mcp_config(args):
+    """Unlike backup_config this runs synchronously and returns the outcome:
+    the whole set is ~7 KB over the LAN, and a backup tool that answers
+    'started' is exactly how you end up believing in a backup that is not
+    happening. verify=true also reads the mirror back off the NAS and compares
+    md5 against what was sent."""
+    verify = args.get("verify", True)
+    if isinstance(verify, str):
+        verify = verify.strip().lower() not in ("0", "false", "no", "off")
+    result = backup_mcp_config(verify=bool(verify))
+    return json.dumps(result, ensure_ascii=False, indent=2)
 
 
 def tool_get_media(args):

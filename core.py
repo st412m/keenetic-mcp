@@ -15,7 +15,7 @@ USER = "admin"
 PASS = "password"
 SECRET = "changeme"
 PORT = 9584
-VERSION = "2.7.2"
+VERSION = "2.7.3"
 
 # Backup config
 BACKUP_ENABLED = False
@@ -26,6 +26,14 @@ BACKUP_RSYNC_HOST = ""
 BACKUP_RSYNC_USER = ""
 BACKUP_RSYNC_KEY = ""
 BACKUP_RSYNC_PATH = ""
+
+# 2.7.3: the weekly rsync run also carries the files git cannot restore -
+# .env and watch_rules.json (both gitignored) and the hand-edited Entware init
+# script. Mirror plus dated-snapshot-on-change; see the header in backup.py.
+# The rsync private key is deliberately NOT in the set: it regenerates in a
+# minute, and putting it on the share it unlocks buys nothing.
+BACKUP_MCP_CONFIG = True
+BACKUP_MCP_INIT = "/opt/etc/init.d/S99keenetic-mcp"
 
 session_cookie = None
 
@@ -81,6 +89,7 @@ def load_env():
     global HOST, USER, PASS, SECRET, PORT
     global BACKUP_ENABLED, BACKUP_SCHEDULE, BACKUP_PATH, BACKUP_KEEP
     global BACKUP_RSYNC_HOST, BACKUP_RSYNC_USER, BACKUP_RSYNC_KEY, BACKUP_RSYNC_PATH
+    global BACKUP_MCP_CONFIG, BACKUP_MCP_INIT
     global PROTECTED_PORTS, PROTECTED_PROXY_NAMES, PROTECTED_UPSTREAMS
     global HTTP_TOOLS_ENABLED, HTTP_TOOL_ALLOWLIST
     global WATCH_ENABLED, WATCH_RULES, WATCH_STATE, WATCH_INTERVAL
@@ -108,6 +117,8 @@ def load_env():
     BACKUP_RSYNC_USER = os.environ.get("BACKUP_RSYNC_USER", "")
     BACKUP_RSYNC_KEY = os.environ.get("BACKUP_RSYNC_KEY", "")
     BACKUP_RSYNC_PATH = os.environ.get("BACKUP_RSYNC_PATH", "")
+    BACKUP_MCP_CONFIG = os.environ.get("BACKUP_MCP_CONFIG", "true").lower() == "true"
+    BACKUP_MCP_INIT = os.environ.get("BACKUP_MCP_INIT", BACKUP_MCP_INIT)
 
     # Protected objects for the write tools. The MCP's own port, its
     # 127.0.0.1:<port> upstream and the 'keenetic-mcp' proxy name are always

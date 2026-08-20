@@ -34,6 +34,7 @@ MUTATING_TOOLS = {
     "unblock_client",
     # Side effects outside the router (rsync to NAS, spawns a worker thread)
     "backup_config",
+    "backup_mcp_config",
     "dump_log",
 }
 

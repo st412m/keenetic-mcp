@@ -12,7 +12,7 @@ from datetime import datetime
 
 from tools_config import tool_get_config, tool_get_dhcp_static, tool_get_firewall_rules, tool_get_keendns_mappings, tool_get_port_forwarding, tool_rci_query, tool_remove_dhcp_host, tool_remove_keendns_mapping, tool_remove_port_forwarding, tool_set_dhcp_host, tool_set_keendns_mapping, tool_set_port_forwarding
 from tools_network import tool_get_channel_analysis, tool_get_clients, tool_get_dhcp_leases, tool_get_extender_log, tool_get_interfaces, tool_get_internet_status, tool_get_log, tool_get_log_by_device, tool_get_mesh_nodes, tool_get_site_survey, tool_get_traffic, tool_get_unregistered_clients, tool_get_vpn_status, tool_get_web_access, tool_get_wifi, tool_get_wifi_stations, tool_get_dns_proxy
-from tools_system import tool_backup_config, tool_block_client, tool_dump_log, tool_get_media, tool_get_opkg_status, tool_get_system_info, tool_list_backups, tool_reboot, tool_register_client, tool_run_ping, tool_unblock_client, tool_update_client, tool_get_schedule
+from tools_system import tool_backup_config, tool_backup_mcp_config, tool_block_client, tool_dump_log, tool_get_media, tool_get_opkg_status, tool_get_system_info, tool_list_backups, tool_reboot, tool_register_client, tool_run_ping, tool_unblock_client, tool_update_client, tool_get_schedule
 
 
 WRITE_TOOLS = {
@@ -246,6 +246,20 @@ TOOLS = {
         "description": "Manually trigger a router config backup right now",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_backup_config,
+    },
+    "backup_mcp_config": {
+        "description": (
+            "Back up the keenetic-mcp files that git cannot restore (.env, "
+            "watch_rules.json, the Entware init script) to the NAS. Refreshes "
+            "the mcp-config/ mirror every run and writes a dated snapshot only "
+            "when the content changed. Runs synchronously and reports what "
+            "happened, including a round-trip md5 check of the mirror. Staging "
+            "is in /tmp (RAM): nothing is written to the USB stick."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "verify": {"type": "boolean", "description": "Read the mirror back and compare md5 (default true)"},
+        }},
+        "fn": tool_backup_mcp_config,
     },
     "dump_log": {
         "description": "Snapshot the current router log and rsync it to the NAS backup path (RAM-only staging, no flash writes). Useful to preserve the log before a reboot.",
