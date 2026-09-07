@@ -262,37 +262,117 @@ def tool_list_backups(args):
     return r.stdout.strip() or r.stderr.strip() or "(empty listing)"
 
 
+def _schedule_actions(runtime, config):
+    """Actions of one schedule, runtime view preferred.
+
+    The runtime view is the readable one: the router itself resolves the day
+    number to a name ("Sat") and min/hour to "02:00". The config tree carries
+    the same actions as raw numbers and is only a fallback - and there the day
+    is left AS A NUMBER on purpose. Keenetic does not document whether `dow`
+    counts from Sunday=0 or Monday=1, and the one live sample available here
+    ("6" for Saturday) fits both conventions. Naming the day from the number
+    would be a guess, and this tool exists to tell an automation when it may
+    reboot the router: a wrong weekday is worse than a bare number.
+    """
+    acts = [a for a in (runtime.get("action") or []) if isinstance(a, dict)]
+    if acts:
+        return [{
+            "type": a.get("type"),
+            "dow": a.get("dow"),
+            "time": a.get("time"),
+            "next": a.get("next", False),
+            "seconds_left": a.get("left"),
+            "source": "runtime",
+        } for a in acts]
+    out = []
+    for a in (config.get("action") or []):
+        if not isinstance(a, dict):
+            continue
+        try:
+            hhmm = "%02d:%02d" % (int(a.get("hour", 0)), int(a.get("min", 0)))
+        except (TypeError, ValueError):
+            hhmm = None
+        out.append({
+            "type": a.get("action"),
+            "dow": None,
+            "dow_number": a.get("dow"),
+            "time": hhmm,
+            "next": None,
+            "seconds_left": None,
+            "source": "config_tree",
+            "note": ("runtime view unavailable for this schedule; the weekday is "
+                     "left as the raw number because the numbering is undocumented"),
+        })
+    return out
+
+
 def tool_get_schedule(args):
-    # Runtime view (next fire, seconds left, resolved dow/time) comes from
-    # show/schedule; the human-readable name lives in the config tree.
-    show = rci({"show": {"schedule": {}}}) or {}
+    """Router schedules, merged from the runtime view and the config tree.
+
+    2.7.4 - until now this answered `actions: []` for a schedule that plainly
+    had actions, next to a phantom entry `{"id": "show", "name": null}`. Both
+    were one bug: `rci()` returns the whole RCI envelope, so the schedules sit
+    under result["show"]["schedule"], and the old code treated the envelope
+    itself as the schedule map. That is where the literal key "show" came from,
+    and why every action list was empty. The phantom was a symptom, not a
+    service node inside the schedule tree - with the envelope unwrapped there
+    is nothing left to filter. `get_system_info` has always had this shape
+    right: result.get("show", {}).get("system", {}).
+
+    A tree that cannot be read is now an ERROR, never an empty list. This tool
+    answers "when may I reboot the router"; an automation that cannot tell
+    "no window is configured" from "I failed to read it" will call every hour
+    safe.
+    """
+    problems = []
+    try:
+        envelope = rci({"show": {"schedule": {}}})
+        if not isinstance(envelope, dict):
+            raise ValueError("unexpected response type %s" % type(envelope).__name__)
+        show = envelope.get("show", {}).get("schedule", {}) or {}
+        if not isinstance(show, dict):
+            raise ValueError("show/schedule is not an object")
+    except Exception as e:
+        show = {}
+        problems.append("runtime view (show/schedule): %s" % e)
     try:
         tree = json.loads(_rci_get("schedule")) or {}
-    except Exception:
+        if not isinstance(tree, dict):
+            raise ValueError("config tree is not an object")
+    except Exception as e:
         tree = {}
+        problems.append("config tree (/rci/schedule): %s" % e)
+
+    if problems:
+        return ("Error: the router's schedules could not be read, and an empty "
+                "answer here would be indistinguishable from 'no schedules are "
+                "configured'. Do not treat this as an empty schedule list. "
+                "Details: " + "; ".join(problems))
+
     out = []
     for sid in sorted(set(show) | set(tree)):
-        s = show.get(sid, {})
-        t = tree.get(sid, {})
-        if not isinstance(s, dict):
-            s = {}
-        if not isinstance(t, dict):
-            t = {}
-        actions = [
-            {
-                "type": a.get("type"),
-                "dow": a.get("dow"),
-                "time": a.get("time"),
-                "next": a.get("next", False),
-                "seconds_left": a.get("left"),
-            }
-            for a in s.get("action", []) if isinstance(a, dict)
-        ]
+        s = show.get(sid) if isinstance(show.get(sid), dict) else {}
+        t = tree.get(sid) if isinstance(tree.get(sid), dict) else {}
         out.append({
             "id": sid,
             "name": t.get("description"),
-            "actions": actions,
+            "actions": _schedule_actions(s, t),
         })
+
     if not out:
-        return "No schedules configured"
-    return json.dumps(out, ensure_ascii=False, indent=2)
+        return ("No schedules are configured. Both the runtime view and the config "
+                "tree were read successfully and both are empty.")
+
+    empty = [e["id"] for e in out if not e["actions"]]
+    if len(empty) == len(out):
+        return ("Error: %d schedule(s) found (%s) but not a single action could be "
+                "read from either tree. A KeeneticOS schedule always carries "
+                "actions, so this is a read failure rather than an empty schedule. "
+                "Cross-check with rci_query path='schedule' config_tree=true."
+                % (len(empty), ", ".join(empty)))
+
+    result = {"count": len(out), "schedules": out}
+    if empty:
+        result["warning"] = ("no actions could be read for: %s - treat those as "
+                             "unknown, not as empty" % ", ".join(empty))
+    return json.dumps(result, ensure_ascii=False, indent=2)

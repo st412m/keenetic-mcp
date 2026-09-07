@@ -10,7 +10,7 @@ import threading
 import time
 from datetime import datetime
 
-from tools_config import tool_get_config, tool_get_dhcp_static, tool_get_firewall_rules, tool_get_keendns_mappings, tool_get_port_forwarding, tool_rci_query, tool_remove_dhcp_host, tool_remove_keendns_mapping, tool_remove_port_forwarding, tool_set_dhcp_host, tool_set_keendns_mapping, tool_set_port_forwarding
+from tools_config import tool_get_config, tool_get_dhcp_static, tool_get_firewall_rules, tool_get_keendns_mappings, tool_get_port_forwarding, tool_rci_query, tool_remove_dhcp_host, tool_remove_dns_host, tool_remove_keendns_mapping, tool_remove_port_forwarding, tool_set_dhcp_host, tool_set_dns_host, tool_set_keendns_mapping, tool_set_port_forwarding
 from tools_network import tool_get_channel_analysis, tool_get_clients, tool_get_dhcp_leases, tool_get_extender_log, tool_get_interfaces, tool_get_internet_status, tool_get_log, tool_get_log_by_device, tool_get_mesh_nodes, tool_get_site_survey, tool_get_traffic, tool_get_unregistered_clients, tool_get_vpn_status, tool_get_web_access, tool_get_wifi, tool_get_wifi_stations, tool_get_dns_proxy
 from tools_system import tool_backup_config, tool_backup_mcp_config, tool_block_client, tool_dump_log, tool_get_media, tool_get_opkg_status, tool_get_system_info, tool_list_backups, tool_reboot, tool_register_client, tool_run_ping, tool_unblock_client, tool_update_client, tool_get_schedule
 
@@ -98,6 +98,38 @@ WRITE_TOOLS = {
             "dry_run": {"type": "boolean", "description": "Default true"},
         }, "required": ["mac"]},
         "fn": tool_remove_dhcp_host,
+    },
+    "set_dns_host": {
+        "description": (
+            "Create a static DNS record ('ip host <domain> <address>') served by "
+            "the router's own DNS proxy - the LAN half of a split-horizon setup, "
+            "where the same name must resolve to an internal reverse proxy inside "
+            "the network and to the WAN address outside it. A name that already "
+            "resolves to a different address is refused rather than extended: "
+            "'ip host' accepts several addresses per name and would round-robin "
+            "it. Remove the old record first. dry_run is TRUE by default; a real "
+            "write is saved to startup-config and verified by re-reading the tree."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "domain": {"type": "string", "description": "Domain name, e.g. 'grafana.example.com'"},
+            "address": {"type": "string", "description": "IPv4 address the name should resolve to"},
+            "dry_run": {"type": "boolean", "description": "Default true"},
+        }, "required": ["domain", "address"]},
+        "fn": tool_set_dns_host,
+    },
+    "remove_dns_host": {
+        "description": (
+            "Delete a static DNS record ('no ip host <domain> <address>'). The "
+            "address is looked up in the config tree, because the router's removal "
+            "form needs both the name and the address; pass it explicitly only to "
+            "disambiguate a name that holds several. dry_run is TRUE by default."
+        ),
+        "inputSchema": {"type": "object", "properties": {
+            "domain": {"type": "string", "description": "Domain name to remove"},
+            "address": {"type": "string", "description": "Address, only needed if the name has several"},
+            "dry_run": {"type": "boolean", "description": "Default true"},
+        }, "required": ["domain"]},
+        "fn": tool_remove_dns_host,
     },
 }
 
@@ -340,12 +372,23 @@ TOOLS = {
         "fn": tool_list_backups,
     },
     "get_dns_proxy": {
-        "description": "DNS proxy status: upstream resolvers (with DoT SNI) and static A/AAAA records from the router's DNS proxy.",
+        "description": (
+            "DNS proxy status: upstream resolvers (with DoT SNI), the static A/AAAA "
+            "records the proxy serves (parsed into domain/address), and the 'ip host' "
+            "config tree that set_dns_host/remove_dns_host write to. A missing "
+            "proxy-status block is reported as an error, not as an empty list."
+        ),
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_dns_proxy,
     },
     "get_schedule": {
-        "description": "List router schedules (e.g. the firmware auto-update window) with name, weekday/time actions and seconds until the next fire.",
+        "description": (
+            "List router schedules (e.g. the firmware auto-update window) with name, "
+            "weekday/time actions and seconds until the next fire. Answers with an "
+            "explicit error, never an empty list, when the schedule trees cannot be "
+            "read - 'no window is configured' and 'I could not read it' must not look "
+            "alike to a caller deciding whether it may reboot the router."
+        ),
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_schedule,
     },

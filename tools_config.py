@@ -21,6 +21,12 @@ RCI_MAX_CHARS = 40000
 
 _MAC_RE = re.compile(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$")
 _IP_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+_DOMAIN_RE = re.compile(
+    r"^(?=.{1,253}$)([a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?\.)*"
+    r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$", re.I)
+
+# KeeneticOS caps static `ip host` bindings at 64 (command reference).
+DNS_HOST_LIMIT = 64
 
 
 class GuardError(Exception):
@@ -123,6 +129,24 @@ def _commit(payload, verify_path, dry_run, summary):
         "after": after,
         "changed": before != after,
     }, ensure_ascii=False, indent=2)
+
+
+def _dns_hosts():
+    """Current `ip host` records. The tree is a list of {"domain","address"};
+    a single record can come back unwrapped, hence the isinstance dance."""
+    entries = _rci_tree("ip/host")
+    if isinstance(entries, dict):
+        entries = [entries]
+    return [e for e in (entries or []) if isinstance(e, dict)]
+
+
+def _norm_domain(value):
+    d = str(value or "").strip().rstrip(".").lower()
+    if not d:
+        raise GuardError("domain is required")
+    if not _DOMAIN_RE.match(d):
+        raise GuardError("'%s' is not a valid domain name" % value)
+    return d
 
 
 def _static_rules():
@@ -371,3 +395,73 @@ def tool_remove_dhcp_host(args):
     return _commit({"ip": {"dhcp": {"host": {"mac": mac, "no": True}}}},
                    "ip/dhcp/host", args.get("dry_run", True),
                    "remove reservation %s (%s)" % (match.get("ip"), mac))
+
+
+
+def tool_set_dns_host(args):
+    """`ip host <domain> <address>` - a static record served by the router's own
+    DNS proxy. This is the LAN half of split-horizon: public DNS points the name
+    at the WAN address, this record points clients inside the network straight at
+    the reverse proxy, so a new site behind Caddy needs one of these every time.
+
+    `ip host` is a multiple-input command: writing a second address for a name
+    that already has one ADDS it and the proxy then round-robins the name. That
+    is almost never what someone repointing a site wants, so a conflicting name
+    is refused and has to be removed first - the same shape as set_dhcp_host
+    refusing an IP already reserved for another MAC.
+    """
+    try:
+        domain = _norm_domain(args.get("domain"))
+        address = str(args.get("address", "")).strip()
+        if not _IP_RE.match(address):
+            raise GuardError("'%s' is not an IPv4 address" % args.get("address"))
+        hosts = _dns_hosts()
+        same_name = [h for h in hosts
+                     if str(h.get("domain", "")).strip().rstrip(".").lower() == domain]
+        if same_name and not any(h.get("address") == address for h in same_name):
+            raise GuardError(
+                "%s already resolves to %s. `ip host` allows several addresses per "
+                "name, so writing another one would load-balance the name instead "
+                "of moving it - remove the old record first: "
+                "remove_dns_host domain='%s'"
+                % (domain, ", ".join(str(h.get("address")) for h in same_name), domain))
+        if not same_name and len(hosts) >= DNS_HOST_LIMIT:
+            raise GuardError(
+                "the router already holds %d static `ip host` records and the "
+                "documented limit is %d" % (len(hosts), DNS_HOST_LIMIT))
+    except GuardError as e:
+        return "Refused: %s" % e
+    return _commit({"ip": {"host": {"domain": domain, "address": address}}},
+                   "ip/host", args.get("dry_run", True),
+                   "static DNS record %s -> %s" % (domain, address))
+
+
+def tool_remove_dns_host(args):
+    """`no ip host <domain> <address>`. The address is not optional in the
+    router's command - the Keenetic command reference spells the removal form as
+    `no ip host domain address` - so it is filled in from the tree rather than
+    left out of the payload. A name holding several addresses is refused until
+    the caller says which one."""
+    try:
+        domain = _norm_domain(args.get("domain"))
+    except GuardError as e:
+        return "Refused: %s" % e
+    address = str(args.get("address", "") or "").strip()
+    matches = [h for h in _dns_hosts()
+               if str(h.get("domain", "")).strip().rstrip(".").lower() == domain]
+    if address:
+        matches = [h for h in matches if h.get("address") == address]
+    if not matches:
+        return "No static DNS record for %s%s" % (
+            domain, (" -> %s" % address) if address else "")
+    if len(matches) > 1:
+        return ("%d records for %s (%s) - name the address to pick one"
+                % (len(matches), domain,
+                   ", ".join(str(h.get("address")) for h in matches)))
+    rec = matches[0]
+    return _commit({"ip": {"host": {"domain": rec.get("domain"),
+                                    "address": rec.get("address"),
+                                    "no": True}}},
+                   "ip/host", args.get("dry_run", True),
+                   "remove static DNS record %s -> %s"
+                   % (rec.get("domain"), rec.get("address")))

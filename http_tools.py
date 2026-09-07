@@ -26,6 +26,8 @@ MUTATING_TOOLS = {
     "remove_keendns_mapping",
     "set_dhcp_host",
     "remove_dhcp_host",
+    "set_dns_host",
+    "remove_dns_host",
     # State-changing tools without a dry_run guard
     "reboot",
     "register_client",

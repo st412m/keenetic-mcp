@@ -10,7 +10,7 @@ import threading
 import time
 from datetime import datetime
 
-from core import _rci_node, rci
+from core import _rci_get, _rci_node, rci
 from helpers import _format_log_line, _get_ap, _get_extender_hosts, _get_hotspot_hosts, _get_node, _log_time_window, _parse_log_dict, pre_ntp_notice
 
 
@@ -469,11 +469,41 @@ def tool_get_extender_log(args):
     return "\n".join(output).strip()
 
 
+_STATIC_RECORD_RE = re.compile(
+    r"^static_(a|aaaa)\s*=\s*(\S+)\s+(\S+)(?:\s+(\S+))?\s*$", re.I)
+
+
 def tool_get_dns_proxy(args):
-    data = rci({"show": {"dns-proxy": {}}})
+    """DNS proxy: upstream resolvers, and the static records the router serves.
+
+    2.7.4 - this answered "No DNS proxy status returned" on a router carrying
+    nine static records, and had done so since the tool was added in 2.5.0.
+    `rci()` hands back the whole RCI envelope, so the payload lives under
+    result["show"]["dns-proxy"], while the old code looked for "proxy-status"
+    at the top level and always missed. Exactly the bug get_schedule had.
+    What hid it: `GET /rci/show/dns-proxy` - which is what rci_query does -
+    returns the payload WITHOUT the envelope, so a manual cross-check showed
+    the data and the tool looked merely "empty" rather than broken.
+
+    The `ip host` config tree is included too, because that is the branch
+    set_dns_host / remove_dns_host write to: without it, verifying a write
+    means reading a second tool.
+    """
+    try:
+        envelope = rci({"show": {"dns-proxy": {}}})
+        if not isinstance(envelope, dict):
+            raise ValueError("unexpected response type %s" % type(envelope).__name__)
+        data = envelope.get("show", {}).get("dns-proxy", {}) or {}
+    except Exception as e:
+        return "Error reading show/dns-proxy: %s" % e
+
     proxies = data.get("proxy-status", []) if isinstance(data, dict) else []
     if not proxies:
-        return "No DNS proxy status returned"
+        return ("Error: show/dns-proxy came back without a proxy-status block. The "
+                "DNS proxy is either not running or the response shape changed - "
+                "this is NOT the same as 'no static records'. Cross-check with "
+                "rci_query path='dns-proxy'.")
+
     out = []
     for p in proxies:
         if not isinstance(p, dict):
@@ -488,8 +518,19 @@ def tool_get_dns_proxy(args):
                 local = rhs.split()[0] if rhs else ""
                 real = rhs.split("#", 1)[1].strip() if "#" in rhs else None
                 upstreams.append({"local": local, "server": real})
-            elif line.startswith("static_a ") or line.startswith("static_aaaa "):
-                static.append(line)
+                continue
+            m = _STATIC_RECORD_RE.match(line)
+            if m:
+                # The trailing number is the router's own flag. It is NOT a
+                # reliable "user record" marker - a cloud-agent record was seen
+                # carrying 0 - so it is passed through unread.
+                static.append({
+                    "type": m.group(1).upper(),
+                    "domain": m.group(2),
+                    "address": m.group(3),
+                    "flag": m.group(4),
+                    "raw": line,
+                })
         dot = [
             {"address": s.get("address"), "sni": s.get("sni")}
             for s in p.get("proxy-tls", {}).get("server-tls", [])
@@ -501,4 +542,13 @@ def tool_get_dns_proxy(args):
             "dot_servers": dot,
             "static_records": static,
         })
-    return json.dumps(out, ensure_ascii=False, indent=2)
+
+    result = {"proxies": out}
+    try:
+        hosts = json.loads(_rci_get("ip/host"))
+        if isinstance(hosts, dict):
+            hosts = [hosts]
+        result["ip_host_config"] = [h for h in (hosts or []) if isinstance(h, dict)]
+    except Exception as e:
+        result["ip_host_config_error"] = str(e)
+    return json.dumps(result, ensure_ascii=False, indent=2)
