@@ -1,18 +1,15 @@
 import json
 import hashlib
 import urllib.request
-import urllib.error
-import http.server
 import os
 import shutil
 import subprocess
-import re
 import threading
 import time
 from datetime import datetime
 
 import core
-from core import auth, rci
+from core import auth
 
 
 def syslog(message):

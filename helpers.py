@@ -1,17 +1,10 @@
 import json
-import hashlib
-import urllib.request
-import urllib.error
-import http.server
-import os
-import subprocess
 import re
-import threading
 import time
 from datetime import datetime, timedelta
 
 from backup import fetch_running_config, syslog
-from core import rci
+from core import rci, _rci_get
 
 
 def _get_ap(host):
@@ -76,6 +69,69 @@ def _get_extender_hosts():
     ]
 
 
+def _known_host_entry(mac):
+    """One device's registration from /rci/known/host - a silent no-op there
+    (unknown field, no error) is what actually bit register_client and
+    update_client on 2026-07-02, so callers re-read this after writing rather
+    than trusting the absence of an RCI error.
+
+    The tree is keyed by NAME, not MAC - confirmed live 2026-09-19, against
+    salatmaster/keenetic-mcp's docs/rci-api.md claiming this branch never
+    returns a name at all. So the match here is by value, not by key.
+    """
+    try:
+        tree = json.loads(_rci_get("known/host"))
+    except Exception:
+        return None
+    if not isinstance(tree, dict):
+        return None
+    for name, v in tree.items():
+        if isinstance(v, dict) and str(v.get("mac", "")).lower() == mac:
+            return {"name": name, "mac": v.get("mac")}
+    return None
+
+
+def _dhcp_host_entry(mac):
+    """One device's static DHCP reservation from /rci/ip/dhcp/host."""
+    try:
+        entries = json.loads(_rci_get("ip/dhcp/host"))
+    except Exception:
+        return None
+    if isinstance(entries, dict):
+        entries = [entries]
+    for e in (entries or []):
+        if isinstance(e, dict) and str(e.get("mac", "")).lower() == mac:
+            return e
+    return None
+
+
+def _hotspot_access_entry(mac):
+    """Access/policy/schedule slice of one device's hotspot host record - not
+    the whole record, whose traffic counters and radio stats change on every
+    poll regardless of what block/unblock actually wrote."""
+    for h in _get_hotspot_hosts():
+        if isinstance(h, dict) and str(h.get("mac", "")).lower() == mac:
+            return {"access": h.get("access"), "policy": h.get("policy"),
+                    "schedule": h.get("schedule")}
+    return None
+
+
+def _intent_error(field, requested, actual):
+    """RCI answered a write with no error and the tree still shows the old
+    value - the 2026-07-02 failure mode. Kept out of `errors` on purpose
+    (B2): that list holds only what the router itself returned, in its own
+    shape (status/code/ident/message); a synthetic entry of a different shape
+    dropped in there would confuse anything that parses errors as RCI output.
+    """
+    return {
+        "field": field,
+        "requested": requested,
+        "actual": actual,
+        "message": "router accepted the %s write without an RCI error, but "
+                    "the value did not change" % field,
+    }
+
+
 def _rci_statuses(result):
     """Extract flat list of status dicts from an RCI response (any depth)."""
     found = []
@@ -99,15 +155,85 @@ def _rci_errors(result):
     return [s for s in _rci_statuses(result) if s.get("status") == "error"]
 
 
+# Measured 2026-09-19 on live acceptance (KN-1010, KeeneticOS 5.1.5): a save
+# takes 4-5s end to end - the router log shows 'saving (<agent>)' then
+# 'configuration saved' 4s apart in nine of ten samples, 5s in one. The old
+# 2000 left every one of the eight acceptance writes at "pending". 6000 was
+# rejected too: on a single-threaded server where 'show log' alone can run
+# 6-7s, a one-second margin invites a spurious "pending" from unrelated
+# contention rather than from the save itself. The chosen value costs up to
+# 7s blocked on a write call, which is acceptable - writes are rare, and
+# this timeout never touches the read tools HA polls.
+SAVE_VERIFY_TIMEOUT_MS = 7000
+SAVE_VERIFY_INTERVAL_MS = 250
+
+
 def _save_config():
     """Persist running-config so changes survive a reboot (web UI does this
-    automatically; raw RCI writes do not)."""
+    automatically; raw RCI writes do not).
+
+    Returns a dict, not a bool. Measured 2026-09-19: the router answers the
+    save call before the on-disk checksum catches up (lag 4-5s, narrowed from
+    an earlier 1-8s estimate once the log gave exact start/end timestamps),
+    so treating "no exception" as "saved" was wrong - config_saved:true meant
+    only that the request went out. The fail-safe block's own flag cannot
+    substitute for this: it read false in every sample taken right after a
+    write, including the ones still mid-save. The only reliable signal is
+    show/last-change.checksum changing. Polling blocks this single-threaded
+    server, so the wait is capped at SAVE_VERIFY_TIMEOUT_MS; a save that has
+    not confirmed by then comes back as status "pending" - applied, not yet
+    verified on disk - not as a failure.
+    """
     try:
-        rci({"system": {"configuration": {"save": {}}}})
-        return True
+        before = rci({"show": {"last-change": {}}}).get("show", {}).get("last-change", {}) or {}
+    except Exception as e:
+        syslog(f"WARNING: config save failed reading checksum before save: {e}")
+        return {"ok": False, "verified": False, "status": "error",
+                "checksum_before": None, "checksum_after": None,
+                "agent": None, "waited_ms": 0, "errors": [str(e)]}
+    checksum_before = before.get("checksum")
+
+    try:
+        result = rci({"system": {"configuration": {"save": {}}}})
     except Exception as e:
         syslog(f"WARNING: config save failed: {e}")
-        return False
+        return {"ok": False, "verified": False, "status": "error",
+                "checksum_before": checksum_before, "checksum_after": None,
+                "agent": None, "waited_ms": 0, "errors": [str(e)]}
+    errors = _rci_errors(result)
+    if errors:
+        syslog(f"WARNING: config save returned errors: {errors}")
+        return {"ok": False, "verified": False, "status": "error",
+                "checksum_before": checksum_before, "checksum_after": None,
+                "agent": None, "waited_ms": 0, "errors": errors}
+
+    checksum_after = checksum_before
+    agent = before.get("agent")
+    verified = False
+    waited_ms = 0
+    while waited_ms < SAVE_VERIFY_TIMEOUT_MS:
+        time.sleep(SAVE_VERIFY_INTERVAL_MS / 1000.0)
+        waited_ms += SAVE_VERIFY_INTERVAL_MS
+        try:
+            after = rci({"show": {"last-change": {}}}).get("show", {}).get("last-change", {}) or {}
+        except Exception:
+            continue
+        checksum_after = after.get("checksum")
+        agent = after.get("agent")
+        if checksum_after != checksum_before:
+            verified = True
+            break
+
+    return {
+        "ok": True,
+        "verified": verified,
+        "status": "confirmed" if verified else "pending",
+        "checksum_before": checksum_before,
+        "checksum_after": checksum_after,
+        "agent": agent,
+        "waited_ms": waited_ms,
+        "errors": [],
+    }
 
 
 SECRET_PATTERNS = [

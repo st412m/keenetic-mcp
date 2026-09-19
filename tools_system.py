@@ -1,11 +1,6 @@
 import json
-import hashlib
-import urllib.request
-import urllib.error
-import http.server
 import os
 import subprocess
-import re
 import threading
 import time
 from datetime import datetime
@@ -13,7 +8,8 @@ from datetime import datetime
 import core
 from backup import backup_mcp_config, do_backup, rsync_to_remote, syslog
 from core import VERSION, _rci_get, rci
-from helpers import _rci_errors, _save_config
+from helpers import (_dhcp_host_entry, _hotspot_access_entry, _intent_error,
+    _known_host_entry, _rci_errors, _save_config)
 from tools_network import tool_get_log
 
 
@@ -55,75 +51,261 @@ def tool_register_client(args):
     #   known host <name> <mac>          (Core::KnownHosts)
     # NOT in `ip hotspot host`, which only manages access/policy/schedule
     # for hosts that are already known ("name" there is a read-only echo).
+    name_before = _known_host_entry(mac)
     result = rci({"known": {"host": {"name": name_val, "mac": mac}}})
     errors = _rci_errors(result)
-    if errors:
-        return f"Error registering {mac}: " + json.dumps(errors, ensure_ascii=False)
+    name_after = _known_host_entry(mac)
+    before = {"name": name_before}
+    after = {"name": name_after}
+    changed = name_before != name_after
+    name_matches = bool(name_after) and name_after.get("name") == name_val
+    intent_err = None
+    if not errors and not name_matches:
+        intent_err = _intent_error("name", name_val,
+                                    name_after.get("name") if name_after else None)
+    if errors or intent_err:
+        save_attempted = (not errors and name_matches) or changed
+        save_detail = _save_config() if save_attempted else None
+        return json.dumps({
+            "summary": f"register {mac} as '{name_val}'",
+            "errors": errors,
+            "intent_error": intent_err,
+            "before": before,
+            "after": after,
+            "changed": changed,
+            "matches_intent": name_matches,
+            "save_attempted": save_attempted,
+            "config_saved": bool(save_detail and save_detail["ok"]),
+            "save_verified": bool(save_detail and save_detail["verified"]),
+            "save_detail": save_detail,
+        }, ensure_ascii=False, indent=2)
+    ip_matches = True
     if ip_val:
         # Static DHCP binding: `ip dhcp host <mac> <ip>`
+        ip_before = _dhcp_host_entry(mac)
         result_ip = rci({"ip": {"dhcp": {"host": {"mac": mac, "ip": ip_val}}}})
-        ip_errors = _rci_errors(result_ip)
-        if ip_errors:
-            _save_config()
-            return (f"Device {mac} registered as '{name_val}', but static IP failed: "
-                    + json.dumps(ip_errors, ensure_ascii=False))
-    _save_config()
-    return f"Device {mac} registered as '{name_val}'" + (f" with IP {ip_val}" if ip_val else "")
+        errors = _rci_errors(result_ip)
+        ip_after = _dhcp_host_entry(mac)
+        before["ip"] = ip_before
+        after["ip"] = ip_after
+        changed = changed or (ip_before != ip_after)
+        ip_matches = bool(ip_after) and ip_after.get("ip") == ip_val
+        intent_err = None
+        if not errors and not ip_matches:
+            intent_err = _intent_error("ip", ip_val,
+                                        ip_after.get("ip") if ip_after else None)
+    matches_intent = name_matches and ip_matches
+    save_attempted = (not errors and matches_intent) or changed
+    save_detail = _save_config() if save_attempted else None
+    if errors or intent_err:
+        summary = f"registered {mac} as '{name_val}', but static IP failed"
+    else:
+        summary = f"registered {mac} as '{name_val}'" + (f" with IP {ip_val}" if ip_val else "")
+    return json.dumps({
+        "summary": summary,
+        "errors": errors,
+        "intent_error": intent_err,
+        "before": before,
+        "after": after,
+        "changed": changed,
+        "matches_intent": matches_intent,
+        "save_attempted": save_attempted,
+        "config_saved": bool(save_detail and save_detail["ok"]),
+        "save_verified": bool(save_detail and save_detail["verified"]),
+        "save_detail": save_detail,
+    }, ensure_ascii=False, indent=2)
 
 
 def tool_update_client(args):
     mac = args.get("mac", "").lower().strip()
     if not mac:
         return "Error: mac required"
-    changed = {}
+    requested = {}
+    before = {}
+    after = {}
+    changed = False
     if args.get("name"):
         name_val = args["name"].strip()
+        name_before = _known_host_entry(mac)
         result = rci({"known": {"host": {"name": name_val, "mac": mac}}})
         errors = _rci_errors(result)
-        if errors:
-            return f"Error updating name for {mac}: " + json.dumps(errors, ensure_ascii=False)
-        changed["name"] = name_val
+        name_after = _known_host_entry(mac)
+        before["name"] = name_before
+        after["name"] = name_after
+        name_matches = bool(name_after) and name_after.get("name") == name_val
+        intent_err = None
+        if not errors and not name_matches:
+            intent_err = _intent_error("name", name_val,
+                                        name_after.get("name") if name_after else None)
+        name_changed = name_before != name_after
+        if errors or intent_err:
+            save_attempted = (not errors and name_matches) or name_changed
+            save_detail = _save_config() if save_attempted else None
+            return json.dumps({
+                "summary": f"update name for {mac}",
+                "errors": errors,
+                "intent_error": intent_err,
+                "before": before,
+                "after": after,
+                "changed": name_changed,
+                "matches_intent": name_matches,
+                "save_attempted": save_attempted,
+                "config_saved": bool(save_detail and save_detail["ok"]),
+                "save_verified": bool(save_detail and save_detail["verified"]),
+                "save_detail": save_detail,
+            }, ensure_ascii=False, indent=2)
+        changed = changed or name_changed
+        requested["name"] = name_val
     if args.get("ip"):
         ip_val = args["ip"].strip()
+        ip_before = _dhcp_host_entry(mac)
         result = rci({"ip": {"dhcp": {"host": {"mac": mac, "ip": ip_val}}}})
         errors = _rci_errors(result)
-        if errors:
-            if changed:
-                _save_config()
-            return f"Error updating IP for {mac}: " + json.dumps(errors, ensure_ascii=False)
-        changed["ip"] = ip_val
-    if not changed:
+        ip_after = _dhcp_host_entry(mac)
+        before["ip"] = ip_before
+        after["ip"] = ip_after
+        ip_matches = bool(ip_after) and ip_after.get("ip") == ip_val
+        intent_err = None
+        if not errors and not ip_matches:
+            intent_err = _intent_error("ip", ip_val,
+                                        ip_after.get("ip") if ip_after else None)
+        ip_changed = ip_before != ip_after
+        if errors or intent_err:
+            total_changed = changed or ip_changed
+            save_attempted = (not errors and ip_matches) or total_changed
+            save_detail = _save_config() if save_attempted else None
+            return json.dumps({
+                "summary": f"update IP for {mac}",
+                "errors": errors,
+                "intent_error": intent_err,
+                "before": before,
+                "after": after,
+                "changed": total_changed,
+                "matches_intent": ip_matches,
+                "save_attempted": save_attempted,
+                "config_saved": bool(save_detail and save_detail["ok"]),
+                "save_verified": bool(save_detail and save_detail["verified"]),
+                "save_detail": save_detail,
+            }, ensure_ascii=False, indent=2)
+        changed = changed or ip_changed
+        requested["ip"] = ip_val
+    if not requested:
         return "Error: nothing to update (provide name and/or ip)"
-    _save_config()
-    return f"Device {mac} updated: " + json.dumps(changed, ensure_ascii=False)
+    save_detail = _save_config()
+    parts = []
+    if "name" in requested:
+        parts.append("name='%s'" % requested["name"])
+    if "ip" in requested:
+        parts.append("ip=%s" % requested["ip"])
+    return json.dumps({
+        "summary": "%s updated: %s" % (mac, ", ".join(parts)),
+        "errors": [],
+        "intent_error": None,
+        "before": before,
+        "after": after,
+        "changed": changed,
+        "matches_intent": True,
+        "save_attempted": True,
+        "config_saved": save_detail["ok"],
+        "save_verified": save_detail["verified"],
+        "save_detail": save_detail,
+    }, ensure_ascii=False, indent=2)
 
 
 def tool_block_client(args):
     mac = args.get("mac", "").lower().strip()
     if not mac:
         return "Error: mac address required"
+    access_before = _hotspot_access_entry(mac)
+    before = {"access": access_before}
+    registering = False
     result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "deny"}}}})
     statuses = result.get("ip", {}).get("hotspot", {}).get("host", {}).get("status", [])
     if any(s.get("code") == "19007441" for s in statuses):
         # Unregistered host: register it first via KnownHosts, then deny.
+        # A registration that lands here must survive even if the deny that
+        # follows turns out to be a no-op (B1) - so it feeds the same
+        # before/after/changed this tool already tracks for 'access',
+        # instead of a save decision hanging off the deny call alone.
+        registering = True
+        before["name"] = _known_host_entry(mac)
         reg = rci({"known": {"host": {"name": "Blocked Device", "mac": mac}}})
         reg_errors = _rci_errors(reg)
         if reg_errors:
-            return "Error auto-registering before block: " + json.dumps(reg_errors, ensure_ascii=False)
+            after = {"access": _hotspot_access_entry(mac),
+                     "name": _known_host_entry(mac)}
+            changed = before != after
+            save_detail = _save_config() if changed else None
+            return json.dumps({
+                "summary": f"block {mac}",
+                "errors": reg_errors,
+                "intent_error": None,
+                "before": before,
+                "after": after,
+                "changed": changed,
+                "matches_intent": False,
+                "save_attempted": changed,
+                "config_saved": bool(save_detail and save_detail["ok"]),
+                "save_verified": bool(save_detail and save_detail["verified"]),
+                "save_detail": save_detail,
+            }, ensure_ascii=False, indent=2)
         result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "deny"}}}})
-    if not _rci_errors(result):
-        _save_config()
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    errors = _rci_errors(result)
+    after = {"access": _hotspot_access_entry(mac)}
+    if registering:
+        after["name"] = _known_host_entry(mac)
+    changed = before != after
+    matches_intent = bool(after["access"]) and after["access"].get("access") == "deny"
+    intent_err = None
+    if not errors and not matches_intent:
+        intent_err = _intent_error(
+            "access", "deny", after["access"].get("access") if after["access"] else None)
+    save_attempted = (not errors and matches_intent) or changed
+    save_detail = _save_config() if save_attempted else None
+    return json.dumps({
+        "summary": f"block {mac}",
+        "errors": errors,
+        "intent_error": intent_err,
+        "before": before,
+        "after": after,
+        "changed": changed,
+        "matches_intent": matches_intent,
+        "save_attempted": save_attempted,
+        "config_saved": bool(save_detail and save_detail["ok"]),
+        "save_verified": bool(save_detail and save_detail["verified"]),
+        "save_detail": save_detail,
+    }, ensure_ascii=False, indent=2)
 
 
 def tool_unblock_client(args):
     mac = args.get("mac", "").lower().strip()
     if not mac:
         return "Error: mac address required"
+    access_before = _hotspot_access_entry(mac)
     result = rci({"ip": {"hotspot": {"host": {"mac": mac, "access": "permit"}}}})
-    if not _rci_errors(result):
-        _save_config()
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    errors = _rci_errors(result)
+    access_after = _hotspot_access_entry(mac)
+    changed = access_before != access_after
+    matches_intent = bool(access_after) and access_after.get("access") == "permit"
+    intent_err = None
+    if not errors and not matches_intent:
+        intent_err = _intent_error("access", "permit",
+                                    access_after.get("access") if access_after else None)
+    save_attempted = (not errors and matches_intent) or changed
+    save_detail = _save_config() if save_attempted else None
+    return json.dumps({
+        "summary": f"unblock {mac}",
+        "errors": errors,
+        "intent_error": intent_err,
+        "before": {"access": access_before},
+        "after": {"access": access_after},
+        "changed": changed,
+        "matches_intent": matches_intent,
+        "save_attempted": save_attempted,
+        "config_saved": bool(save_detail and save_detail["ok"]),
+        "save_verified": bool(save_detail and save_detail["verified"]),
+        "save_detail": save_detail,
+    }, ensure_ascii=False, indent=2)
 
 
 def dump_log_to_nas(timeout=12):

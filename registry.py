@@ -1,16 +1,4 @@
-import json
-import hashlib
-import urllib.request
-import urllib.error
-import http.server
-import os
-import subprocess
-import re
-import threading
-import time
-from datetime import datetime
-
-from tools_config import tool_get_config, tool_get_dhcp_static, tool_get_firewall_rules, tool_get_keendns_mappings, tool_get_port_forwarding, tool_rci_query, tool_remove_dhcp_host, tool_remove_dns_host, tool_remove_keendns_mapping, tool_remove_port_forwarding, tool_set_dhcp_host, tool_set_dns_host, tool_set_keendns_mapping, tool_set_port_forwarding
+from tools_config import tool_diff_saved_config, tool_get_config, tool_get_config_state, tool_get_dhcp_static, tool_get_firewall_rules, tool_get_keendns_mappings, tool_get_port_forwarding, tool_rci_query, tool_remove_dhcp_host, tool_remove_dns_host, tool_remove_keendns_mapping, tool_remove_port_forwarding, tool_set_dhcp_host, tool_set_dns_host, tool_set_keendns_mapping, tool_set_port_forwarding
 from tools_network import tool_get_channel_analysis, tool_get_clients, tool_get_dhcp_leases, tool_get_extender_log, tool_get_interfaces, tool_get_internet_status, tool_get_log, tool_get_log_by_device, tool_get_mesh_nodes, tool_get_site_survey, tool_get_traffic, tool_get_unregistered_clients, tool_get_vpn_status, tool_get_web_access, tool_get_wifi, tool_get_wifi_stations, tool_get_dns_proxy
 from tools_system import tool_backup_config, tool_backup_mcp_config, tool_block_client, tool_dump_log, tool_get_media, tool_get_opkg_status, tool_get_system_info, tool_list_backups, tool_reboot, tool_register_client, tool_run_ping, tool_unblock_client, tool_update_client, tool_get_schedule
 
@@ -335,6 +323,31 @@ TOOLS = {
             },
         },
         "fn": tool_get_config,
+    },
+    "get_config_state": {
+        "description": (
+            "Parsed show/last-change: when the config was last touched (date "
+            "given both in MSK and UTC), which agent and user touched it, and "
+            "the checksum - the only reliable signal that a save has actually "
+            "landed on disk. The raw fail-safe block is included as-is, but "
+            "its 'unsaved' field is NOT a save indicator - it can read false "
+            "while a save is still in flight. Compare 'checksum' across two "
+            "calls instead."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+        "fn": tool_get_config_state,
+    },
+    "diff_saved_config": {
+        "description": (
+            "Diff running-config against startup-config as CLI text (the "
+            "/ci/ endpoints, outside /rci/) - a direct, checksum-independent "
+            "answer to 'what is not saved yet'. Returns only_in_running and "
+            "only_in_startup line lists; both empty means fully saved. "
+            "Secrets are masked on both sides before comparing. Not wired "
+            "into the write tools - call it on demand, not after every write."
+        ),
+        "inputSchema": {"type": "object", "properties": {}},
+        "fn": tool_diff_saved_config,
     },
     "get_port_forwarding": {
         "description": "List port forwarding / static NAT rules ('ip static') from running-config",

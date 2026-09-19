@@ -2,20 +2,15 @@ import json
 import hashlib
 import urllib.request
 import urllib.error
-import http.server
 import os
-import subprocess
-import re
 import threading
-import time
-from datetime import datetime
 
 HOST = "http://192.168.1.1"
 USER = "admin"
 PASS = "password"
 SECRET = "changeme"
 PORT = 9584
-VERSION = "2.7.4"
+VERSION = "2.8.0"
 
 # Backup config
 BACKUP_ENABLED = False
@@ -278,6 +273,41 @@ def _rci_get_locked(path, timeout=15):
     def do_request():
         req = urllib.request.Request(
             "%s/rci/%s" % (HOST, path),
+            headers={"Cookie": session_cookie or ""},
+            method="GET",
+        )
+        return urllib.request.urlopen(req, timeout=timeout)
+
+    try:
+        resp = do_request()
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            session_cookie = None
+            auth()
+            resp = do_request()
+        else:
+            raise
+    return resp.read().decode("utf-8", "replace")
+
+
+def _ci_get(name, timeout=15):
+    """GET /ci/<name> - the CLI-text config endpoints (running-config.txt,
+    startup-config.txt), outside /rci/ entirely. Same authenticated session
+    and 401 re-login as _rci_get, but _rci_get cannot be reused: it hard-
+    codes the /rci/ prefix. The response is application/octet-stream (plain
+    CLI text), not JSON."""
+    with rci_lock:
+        return _ci_get_locked(name, timeout)
+
+
+def _ci_get_locked(name, timeout=15):
+    global session_cookie
+    if not session_cookie:
+        auth()
+
+    def do_request():
+        req = urllib.request.Request(
+            "%s/ci/%s" % (HOST, name),
             headers={"Cookie": session_cookie or ""},
             method="GET",
         )

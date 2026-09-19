@@ -1,14 +1,6 @@
 import json
-import hashlib
-import urllib.request
-import urllib.error
 import http.server
-import os
-import subprocess
-import re
 import threading
-import time
-from datetime import datetime
 from urllib.parse import urlsplit, parse_qs, unquote
 
 import core

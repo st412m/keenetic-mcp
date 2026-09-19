@@ -2,9 +2,9 @@
 
 MCP (Model Context Protocol) server for Keenetic routers. Runs directly on the router via Entware. Allows Claude AI to monitor and manage your router.
 
-Tested on: **Keenetic Giga KN-1010 + KN-1011 (Mesh)**, KeeneticOS **5.1.1** (`5.01.C.1.0-0`), Entware `mipselsf`.
+Tested on: **Keenetic Giga KN-1010 + KN-1011 (Mesh)**, KeeneticOS **5.1.5** (`5.01.C.5.0-0`), Entware `mipselsf`.
 
-Current version: **2.7.4** — 47 tools, no dependencies outside the Python standard library. Tools are reachable over MCP and, since 2.6.0, over plain HTTP for clients that do not speak the protocol (Home Assistant, curl, shell scripts). Since 2.7.0 the server can also push: a background watcher polls the router locally and makes an outbound HTTP call when a rule matches.
+Current version: **2.8.0** — 49 tools, no dependencies outside the Python standard library. Tools are reachable over MCP and, since 2.6.0, over plain HTTP for clients that do not speak the protocol (Home Assistant, curl, shell scripts). Since 2.7.0 the server can also push: a background watcher polls the router locally and makes an outbound HTTP call when a rule matches.
 
 ## Available Tools
 
@@ -33,6 +33,8 @@ Current version: **2.7.4** — 47 tools, no dependencies outside the Python stan
 
 ### Configuration & network rules (read-only)
 - `get_config` — the router's `running-config` with an optional case-insensitive regex filter. Secrets (`md5`, `nthash`, `psk`, `password`, `private-key`, long base64 keys) are masked unless `include_secrets: true`
+- `get_config_state` — parsed `show/last-change`: when the config was last touched (given both in MSK and UTC), which agent and user touched it, and the `checksum` — the only reliable signal that a save has actually landed on disk. The raw `fail-safe` block is included as-is, but its `unsaved` field must **not** be branched on: it can read `false` while a save is still in flight. Compare `checksum` across two calls instead
+- `diff_saved_config` — diffs `running-config` against `startup-config`, both fetched as CLI text from the `/ci/` endpoints (outside `/rci/` entirely). Answers "what is not saved right now": it sees a difference for exactly as long as `checksum` still shows the old value, which is the whole save window (4–5 seconds on the tested hardware, see *Write tool response contract*) — not a guarantee of catching a specific just-made write, since a single MCP round trip rarely beats that window. `only_in_running` / `only_in_startup` are line lists; both empty means fully saved. Expect the config's own service header (`! $$$ Agent / Last change / Md5 / Username`) to show up in the diff whenever the two sides differ at all — that is normal, not an artifact. Secrets are masked on both sides before comparing. Not wired into the write tools — call it on demand
 - `get_port_forwarding` — port forwarding / static NAT rules (`ip static`)
 - `get_firewall_rules` — access-lists with their entries, `ip firewall` settings and interface access-groups
 - `get_keendns_mappings` — KeenDNS / web application access mappings (`ip http proxy`) with their upstreams
@@ -63,6 +65,31 @@ A protected object is refused outright; if you genuinely need to change one, do 
 The corollary is that a list written before a reverse proxy went in will protect the wrong things. Once every site and every API enters through `443` on one proxy, that single rule is worth more than any individual service port, and losing it takes everything down at once — so `80` and `443` belong in `MCP_PROTECTED_PORTS` from the moment the proxy exists. (KeenDNS setups are unaffected: cloud mode needs no forwarding at all, and in direct mode the router itself holds 80 and 443.)
 
 If a write tool refuses you, that is this list talking, not a malfunction. The message names the port or the object; the fix is either to change it in the web interface or to take it out of `.env` deliberately.
+
+### Write tool response contract
+
+Twelve tools write to the router: the four pairs above (`set_port_forwarding` / `remove_port_forwarding`, `set_keendns_mapping` / `remove_keendns_mapping`, `set_dhcp_host` / `remove_dhcp_host`, `set_dns_host` / `remove_dns_host`) plus `register_client`, `update_client`, `block_client` and `unblock_client` (see *How Client Management Works*). Since 2.8.0 all twelve answer with the same fields:
+
+- `errors` — only what the router itself returned (`status` / `code` / `ident` / `message`). Never a synthetic entry
+- `intent_error` — `null`, or `{field, requested, actual, message}` when the router accepted the write with no error but the tree still shows the old value: a silent no-op that `errors` alone cannot see, because the router never complained
+- `transport_error` — `null`, or the exception text when the connection dropped or timed out while reading the response. The write may well have reached the router in that case — there is no way to know — so this is kept separate from a genuine RCI error rather than folded into `errors`
+- `matches_intent` (bool) — whether the value now on the router equals what was actually **requested**, not whether it differs from what was there **before**. A write of the value that was already correct and a silently ignored write both read `changed: false`; `matches_intent` is what tells them apart, and it is what the tool's success is judged on
+- `changed` — informational only, not a success signal. A record that changed but still does not match what was requested is `changed: true` and a failed write at the same time
+- `save_attempted` (bool), alongside `config_saved` (bool, same type as before), `save_verified` (bool) and `save_detail` (the full object `_save_config` returns) — see below
+
+**`config_saved: true` no longer means what it meant before 2.8.0.** It used to mean "the save request was sent and nothing raised an exception" — which is also what it meant in the seconds before the router silently failed to save at all: the router answers a save error with HTTP 200 and a status block in the body, and earlier code never parsed that body. As of 2.8.0, `config_saved` is `true` only once the save request itself came back with no RCI error; `save_attempted` says whether a save was even tried (it is not, for example, when nothing actually landed); `save_verified` says whether the checksum on disk was actually seen to change.
+
+**`save_detail.status: "pending"` is a normal outcome, not an error.**
+
+- A save takes about 4–5 seconds on this hardware; the write tool polls up to `SAVE_VERIFY_TIMEOUT_MS` (7000ms — see the comment in `helpers.py` for why that number) and returns `pending` if the save has not landed by then.
+- `pending` means the write applied and the save is still settling — it is not a failure. Failures are `errors` (the router said no) and `intent_error` (the router said nothing and did nothing).
+- Polling blocks this single-threaded server, so the cap is finite by design, not "wait as long as it takes".
+- `fail-safe.unsaved` inside `show/last-change` is not a save indicator — it can read `false` while a save is still in flight. Compare `checksum` across two calls instead.
+- `show/last-change`'s `date` is stamped when a save starts; `checksum` changes when it finishes. `show/last-change` tracks `running-config` specifically.
+
+### Breaking change in 2.8.0
+
+`register_client`, `update_client`, `block_client` and `unblock_client` used to return a plain string. As of 2.8.0 they return the same JSON object described above, like every other write tool — there is no compatibility shim for the old text output, and none is planned. This does not get a major version bump: the precedent is 2.5.0, where splitting the monolithic `server.py` into eight modules was a considerably larger internal change and also stayed a minor release.
 
 ### Diagnostics
 - `get_log` — system log with timestamps, optional line count, text filter and time window (`since` / `until`, accepting `HH:MM`, `HH:MM:SS` or `Jul 24 08:00`)
@@ -105,6 +132,8 @@ As of 2.5.0 the server is split into flat modules in the repository root. This i
 - `server.py` — the HTTP / MCP transport and entry point
 
 Behaviour is identical across the split. Adding a tool means writing the function in the relevant `tools_*` module and registering it in `registry.py` — `watcher.py` is the deliberate exception, see above.
+
+**For contributors touching imports:** `import urllib.request` and `import urllib.error` in the same file bind the same name, `urllib`. If either submodule is used anywhere in the file, both imports look "used" to `pyflakes` and to `ruff check --select F` — only one half of the pair may actually be referenced, and the tools stay silent about the other. Verify this specific pair by hand: `grep -n 'urllib\.request\.'` and `grep -n 'urllib\.error\.'` against the file, separately, and check each import line against what the grep actually found.
 
 ## Config Backup
 
@@ -381,7 +410,7 @@ A rule inherits everything it does not set from `defaults`, which is what keeps 
 
 **`source: "log"`** — `match` is a regex against the formatted log line; `exclude` is an optional counter-regex. Capture groups arrive as `${m1}`…`${m9}`, named groups under their own names, plus `${line}`, `${text}`, `${label}`, `${ident}`, `${log_time}`. Cooldown for a log rule is **per rule**: one login writes several lines, and the useful limit is "at most once every N seconds", not "once per distinct wording".
 
-Check that the event you want is actually written before building a rule on it — and check whether the firmware has to be told to write it. **Authentication logging is off by default on KeeneticOS 5.1.1.** Turn it on once and it survives reboots:
+Check that the event you want is actually written before building a rule on it — and check whether the firmware has to be told to write it. **Authentication logging is off by default on KeeneticOS 5.1.1** (observed then; not re-checked on 5.1.5). Turn it on once and it survives reboots:
 
 ```
 ip http log auth
@@ -402,6 +431,8 @@ Two authentication channels write under different prefixes, which is worth knowi
 Earlier versions of this file said a web-configurator login was not logged at all, on 5.1.1, ever. That was wrong — the switch was simply off. The format also differs from Keenetic's own documentation, which shows a session id in the `opened session` line; on 5.1.1 there is none. Match the string your own log actually contains.
 
 Logged without any switch: `Vpn::EventSender: ... connected from` for remote access, with user and source IP, and `Core::System::StartupConfig: saving (http/rci)` when settings are saved — the latter fires for this server's own write tools too, since the log does not say who asked, while a change made through `ndmc` writes `saving (cli)` instead. Beware also of `Core::Authenticator: user "admin" tagged with "http"`: that is the config being replayed at boot, so a rule matching `tag "http"` alone fires on every reboot.
+
+The `config_saved_not_mcp` rule is the mirror of `router_config_saved`: it matches the same `StartupConfig: saving (...)` line but excludes `saving (http/rci)`, so it fires on a save made from the router's own CLI or through `ndmc` — not from the web configurator, and not from this server. That exclusion is also the rule's ceiling, and it is irreducible: a human editing over the web writes `http/rci` too, exactly like keenetic-mcp's own write tools do, and nothing distinguishes the two — not the log line, not the `agent` field in `show/last-change` either. It is enabled by default, unlike most rules here, because it never fires on this server's own writes and so adds no noise on a normal install.
 
 **`source: "rci"`** — `path` is an RCI path (`show/ip/hotspot`), `key` is the field identifying an item (`mac`), `where` / `where_not` select which items count, `on` is any of `appear` (default), `disappear`, `change`, and `change` compares the fields in `track`. Every field of the matched item is a placeholder, nested ones flattened with underscores (`${interface_name}`) and also exposed under their short name when nothing else claims it (`${ap}` for `mws_ap`). Cooldown here is **per item**.
 
@@ -627,7 +658,7 @@ getting the files off this flash drive.
 
 ## Notes
 
-- All 47 tools tested on NDMS 5.1.1
+- All 49 tools tested on live NDMS 5.1.5
 - `get_wifi` uses `show interface` (`show wireless` endpoint removed in NDMS 5.x)
 - `get_traffic` aggregates rx/tx from active clients and shows top 10 by usage
 - `get_channel_analysis` uses site survey data to recommend least congested channel
@@ -668,6 +699,7 @@ getting the files off this flash drive.
 
 ## Changelog
 
+- **2.8.0** — honest save confirmation and intent verification across all twelve write tools, two new read tools, a repository CI check, and an import cleanup left over from the 2.5.0 split, 47 -> 49 tools. `_save_config()` no longer treats "no exception" as "saved": the router can answer a save error with HTTP 200 and a status block the old code never parsed, and the save itself can still be settling seconds after the request returns. It now polls `show/last-change`'s checksum, capped at `SAVE_VERIFY_TIMEOUT_MS`, and reports `confirmed` or an honest `pending` instead of guessing; see *Write tool response contract*. All twelve write tools — the eight through `_commit` and `register_client` / `update_client` / `block_client` / `unblock_client` — now compare the state after a write against what was actually **requested**, not against the state before it: a write of an already-correct value and a silently ignored write used to look identical (`changed: false` either way). The new `matches_intent` field is what tells them apart, and `register_client` / `update_client` / `block_client` / `unblock_client` return JSON now instead of a string to carry it — a breaking change, see *Breaking change in 2.8.0*. New read tools: `get_config_state` (parsed `show/last-change`, with a warning that its `fail-safe.unsaved` field is not reliable) and `diff_saved_config`, which diffs running-config against startup-config as CLI text via the `/ci/running-config.txt` / `/ci/startup-config.txt` endpoints outside `/rci/` — a second, checksum-independent way to see what is not saved right now. `watch_rules.example.json` gains `config_saved_not_mcp`, which catches a config save made from the router's own CLI or through `ndmc`; it cannot catch a human editing over the web, because that writes identically to this server's own saves and the two cannot be told apart. `tools/scan_repo_secrets.py` plus a GitHub Actions workflow fail CI on a real MAC, a real private IP, or a forbidden filename (`CLAUDE.md`, `.env`, `watch_rules.json`) anywhere in the checked-out tree — the actual fix for `.gitignore` alone not stopping a file like that from reaching a public tag; a file that is gitignored but genuinely untracked is skipped, so a local run stays quiet on files that will never be committed. Also: every module still carried the full stdlib import header copied wholesale during the 2.5.0 split; removed what `ruff check --select F` and `pyflakes` flagged, plus a pattern neither tool sees on its own — `import urllib.request` and `import urllib.error` bind the same name, so using either submodule hides the other's unused import from both tools. Verified on Keenetic Giga KN-1010, KeeneticOS 5.1.5
 - **2.7.4** — two read tools that were quietly returning nothing, and static DNS records become writable, 45 -> 47 tools. `get_schedule` reported `actions: []` for a schedule that plainly had actions, alongside a phantom entry `{"id": "show", "name": null}`; `get_dns_proxy` answered `No DNS proxy status returned` on a router serving nine static records. One bug behind both: `rci()` returns the whole RCI envelope and neither tool unwrapped it, so each searched the envelope for keys that live one level down. Nothing raised — they just found nothing, and an empty answer from a read tool is indistinguishable from an empty router. `get_schedule` now treats an unreadable tree as an **error**, because its caller is typically deciding whether it may reboot the router and would otherwise read a failure as "no maintenance window exists, any time is fine". Where only the config tree answers, the weekday is reported as a raw number rather than a name: the numbering is undocumented and the available samples fit both conventions. New write tools `set_dns_host` / `remove_dns_host` manage `ip host` records — the LAN half of split-horizon, previously the one routine operation that still had to be done by hand for every site added behind a reverse proxy. `ip host` takes multiple addresses per name, so a name that already resolves elsewhere is refused instead of silently round-robined; removal sends both name and address, which is the form the router's own `no ip host` requires. Both are in the mutating set and refused over the plain-HTTP route unless allowlisted. `.env.example` adds `80,443` to `MCP_PROTECTED_PORTS` and the README now says out loud that the protection also forbids *creating* a rule — which is what makes listing an unforwarded port meaningful
 - **2.7.3** — the server's own unversioned files are backed up too, 44 -> 45 tools. `.env`, `watch_rules.json` and the Entware init script are restored by neither `git pull` nor a router config backup — the first two are gitignored, the third is edited by hand — so until now they survived only as a manual copy someone had to remember to make. They now ride the same scheduled rsync run as `running-config`. Storage is a hybrid: a `mcp-config/` mirror rewritten every run, plus a dated `mcp-config-YYYY-MM-DD/` snapshot written **only when the content changed** — a directory per run would mean 52 a year for a set that changes about four times, and a single overwritten directory would keep no history at all. Change detection compares `manifest.json` inside the mirror on the receiver: no state file is written to the USB stick, and mtimes decide nothing, since a file restored with a plain `cp` carries the copy's mtime and would look changed forever. There is no rotation, deliberately — nothing here deletes anything on the receiver. The new `backup_mcp_config` tool runs synchronously and reports the outcome, including a round-trip md5 check of what actually landed, rather than answering "started"; it is in the mutating set, so the plain-HTTP route refuses it without an allowlist entry. Copies use `shutil.copy2`, so mtime and mode survive. The rsync private key is excluded: it regenerates in a minute, and storing it on the share it unlocks buys nothing
 - **2.7.2** — fixes log polling, which 2.7.1 broke: `GET /rci/show/log` answers 404, and the router's log exists only as the POST form `{"show": {"log": {}}}`. The watcher now keeps two clients on its single session — GET for RCI rules, POST for the log. Also keeps the proxy host and port readable when masking a rendered rule (`http://***:***@host:port`): which proxy a failed delivery went through is the thing you need to see, the password is not

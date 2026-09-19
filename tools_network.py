@@ -1,14 +1,5 @@
 import json
-import hashlib
-import urllib.request
-import urllib.error
-import http.server
-import os
-import subprocess
 import re
-import threading
-import time
-from datetime import datetime
 
 from core import _rci_get, _rci_node, rci
 from helpers import _format_log_line, _get_ap, _get_extender_hosts, _get_hotspot_hosts, _get_node, _log_time_window, _parse_log_dict, pre_ntp_notice

@@ -28,6 +28,15 @@
       "message": "На роутере сохранена конфигурация (веб-конфигуратор или RCI)"
     },
     {
+      "_comment": "Mirror of router_config_saved, minus http/rci: a save from the router's own CLI or through ndmc, not from the web configurator or from this server. Irreducible gap - a human editing over the web writes 'http/rci' too, exactly like keenetic-mcp's own write tools, so the two are indistinguishable here, not in the log and not via show/last-change's 'agent' field either. The log line is lowercase, 'saving (cli).' - the ndmc console itself prints 'Saving (cli).' with a capital S, a different output stream the log does not follow. Enabled by default: it never fires on this server's own writes, so it generates no noise on a normal install.",
+      "id": "config_saved_not_mcp",
+      "source": "log",
+      "match": "StartupConfig: saving \\(([^)]+)\\)",
+      "exclude": "saving \\(http/rci\\)",
+      "cooldown": 300,
+      "message": "Конфигурация роутера сохранена НЕ через keenetic-mcp (агент: ${m1})"
+    },
+    {
       "_comment": "Web-configurator and RCI logins. Requires authentication logging, which is OFF by default: run 'ip http log auth' then 'system configuration save' in the router CLI (from an Entware shell: ndmc -c '...'). 'exclude' drops this server's own logins - they come from the router's own LAN address - and any other client of your own; adjust the addresses to your network. Cooldown for a log rule is per rule, not per address, so keep it short: with a long one a stranger logging in right after you is swallowed silently.",
       "id": "web_login",
       "source": "log",

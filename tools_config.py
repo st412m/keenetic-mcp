@@ -1,18 +1,11 @@
 import json
-import hashlib
-import urllib.request
 import urllib.error
-import http.server
-import os
-import subprocess
 import re
-import threading
-import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 import core
-from core import _rci_get, rci
-from helpers import _config_blocks, _config_lines, _get_hotspot_hosts, _mask_secrets, _rci_errors, _rci_statuses, _running_config_lines, _save_config
+from core import _ci_get, _rci_get, rci
+from helpers import _config_blocks, _config_lines, _get_hotspot_hosts, _intent_error, _mask_secrets, _rci_errors, _rci_statuses, _running_config_lines, _save_config
 
 
 RCI_GET_BLACKLIST = ("running-config", "crypto", "ppp", "user")
@@ -100,8 +93,34 @@ def _guard_upstream(host, port):
         raise GuardError("upstream %s:%s is protected" % (host, port))
 
 
-def _commit(payload, verify_path, dry_run, summary):
-    """Shared tail for every mutating tool."""
+def _entries(tree):
+    """Normalize an _rci_tree() result to a list of dicts - a lone surviving
+    record often comes back unwrapped (see _dns_hosts)."""
+    if isinstance(tree, list):
+        return [e for e in tree if isinstance(e, dict)]
+    if isinstance(tree, dict):
+        return [tree]
+    return []
+
+
+def _commit(payload, verify_path, dry_run, summary,
+            intent_field, intent_expected, intent_probe):
+    """Shared tail for every mutating tool.
+
+    intent_probe(after) returns the actual value of whatever the write was
+    supposed to produce (or None if it is not in the tree at all);
+    intent_expected is what it should be once the write has taken - None for
+    a removal. RCI answering a write with no error and no effect (B2) is a
+    silent no-op, not success: matches_intent catches it where `changed`
+    alone cannot, because `changed: false` on a no-op write and `changed:
+    false` on a write of the value that was already there are the same
+    answer otherwise.
+
+    A transport exception (timeout, dropped connection while reading the
+    response) is the case most likely to mean "the router applied it, we
+    just didn't find out" (B6) - so it gets the same after/changed/
+    matches_intent/save treatment as a normal reply, not a bare string.
+    """
     if dry_run:
         return json.dumps({
             "dry_run": True,
@@ -111,24 +130,43 @@ def _commit(payload, verify_path, dry_run, summary):
         }, ensure_ascii=False, indent=2)
 
     before = _rci_tree(verify_path)
+
+    def _finish(errors, statuses, transport_error):
+        after = _rci_tree(verify_path)
+        changed = before != after
+        actual = intent_probe(after)
+        matches_intent = actual == intent_expected
+        intent_err = None
+        if not errors and not matches_intent and not transport_error:
+            intent_err = _intent_error(intent_field, intent_expected, actual)
+        save_attempted = (not errors and matches_intent) or changed
+        save_detail = _save_config() if save_attempted else None
+        return json.dumps({
+            "dry_run": False,
+            "summary": summary,
+            "sent": payload,
+            "statuses": statuses,
+            "errors": errors,
+            "intent_error": intent_err,
+            "transport_error": transport_error,
+            "before": before,
+            "after": after,
+            "changed": changed,
+            "matches_intent": matches_intent,
+            "save_attempted": save_attempted,
+            "config_saved": bool(save_detail and save_detail["ok"]),
+            "save_verified": bool(save_detail and save_detail["verified"]),
+            "save_detail": save_detail,
+        }, ensure_ascii=False, indent=2)
+
     try:
         result = rci(payload)
     except Exception as e:
-        return "Error sending payload: %s" % e
-    errors = _rci_errors(result)
-    saved = _save_config() if not errors else False
-    after = _rci_tree(verify_path)
-    return json.dumps({
-        "dry_run": False,
-        "summary": summary,
-        "sent": payload,
-        "statuses": _rci_statuses(result),
-        "errors": errors,
-        "config_saved": saved,
-        "before": before,
-        "after": after,
-        "changed": before != after,
-    }, ensure_ascii=False, indent=2)
+        # No RCI response came back, so there is nothing to blame on the
+        # router (statuses stays empty) - the exception is ours to report,
+        # kept out of `errors` for the same reason as intent_error (B2).
+        return _finish([], [], str(e))
+    return _finish(_rci_errors(result), _rci_statuses(result), None)
 
 
 def _dns_hosts():
@@ -207,6 +245,76 @@ def tool_get_config(args):
     return head + "\n" + "\n".join(shown)
 
 
+def tool_get_config_state(args):
+    """Parsed show/last-change: when the config was last touched, by what
+    agent and user, and the checksum - the only reliable signal that a save
+    has actually landed on disk (see _save_config in helpers.py, and
+    diff_saved_config for a second, independent way to answer the same
+    question).
+
+    The raw 'fail-safe' block is included as-is, but its 'unsaved' field is
+    NOT a save indicator: it can read false while a save is still in flight.
+    Do not branch on it - compare 'checksum' against a previous reading
+    instead.
+    """
+    try:
+        envelope = rci({"show": {"last-change": {}}})
+        if not isinstance(envelope, dict):
+            raise ValueError("unexpected response type %s" % type(envelope).__name__)
+        data = envelope.get("show", {}).get("last-change", {}) or {}
+    except Exception as e:
+        return "Error reading show/last-change: %s" % e
+
+    date_str = data.get("date")
+    date_out = {"utc": None, "msk": None}
+    if date_str:
+        try:
+            dt_utc = datetime.strptime(date_str, "%a, %d %b %Y %H:%M:%S GMT")
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        except ValueError:
+            date_out["utc"] = date_str
+        else:
+            date_out["utc"] = dt_utc.strftime("%Y-%m-%d %H:%M:%SZ")
+            date_out["msk"] = (dt_utc + timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S MSK")
+
+    return json.dumps({
+        "date": date_out,
+        "agent": data.get("agent"),
+        "user": data.get("user"),
+        "checksum": data.get("checksum"),
+        "fail-safe": data.get("fail-safe"),
+    }, ensure_ascii=False, indent=2)
+
+
+def tool_diff_saved_config(args):
+    """Diff running-config against startup-config, both fetched as CLI text
+    from the /ci/ endpoints (outside /rci/ entirely) - a direct, checksum-
+    independent answer to "what is not saved yet": a non-empty
+    only_in_running means the running config has lines startup-config does
+    not have (unsaved change); only_in_startup is the mirror case (rare -
+    usually means something reverted since the last save).
+
+    Not wired into _commit: two ~12 KB text fetches per write is too much
+    for a single-threaded server on every call, so this is opt-in. Secrets
+    are masked on BOTH sides before comparing - comparing a masked line
+    against an unmasked one would report every secret-bearing line as
+    changed, saved or not.
+    """
+    try:
+        running = _ci_get("running-config.txt")
+        startup = _ci_get("startup-config.txt")
+    except Exception as e:
+        return "Error reading /ci/running-config.txt or /ci/startup-config.txt: %s" % e
+    running_lines = _mask_secrets(running.splitlines())
+    startup_lines = _mask_secrets(startup.splitlines())
+    startup_set = set(startup_lines)
+    running_set = set(running_lines)
+    return json.dumps({
+        "only_in_running": [l for l in running_lines if l not in startup_set],
+        "only_in_startup": [l for l in startup_lines if l not in running_set],
+    }, ensure_ascii=False, indent=2)
+
+
 def tool_get_port_forwarding(args):
     try:
         rules = _config_lines("ip static")
@@ -283,8 +391,15 @@ def tool_set_port_forwarding(args):
         rule["disable"] = True if args.get("enable") is False else {"no": True}
     except GuardError as e:
         return "Refused: %s" % e
+
+    def _probe(after):
+        for r in _entries(after):
+            if r.get("protocol") == proto and r.get("port") == port:
+                return r.get("to-host")
+        return None
     return _commit({"ip": {"static": rule}}, "ip/static", args.get("dry_run", True),
-                   "forward %s/%s on %s -> %s" % (proto, port, rule["interface"], to_host))
+                   "forward %s/%s on %s -> %s" % (proto, port, rule["interface"], to_host),
+                   "to_host", to_host, _probe)
 
 
 def tool_remove_port_forwarding(args):
@@ -316,11 +431,18 @@ def tool_remove_port_forwarding(args):
 
     payload_rule = {k: v for k, v in rule.items() if k != "disable"}
     payload_rule["no"] = True
+
+    def _probe(after):
+        for r in _entries(after):
+            if r.get("index") == rule.get("index"):
+                return r.get("index")
+        return None
     return _commit({"ip": {"static": payload_rule}}, "ip/static",
                    args.get("dry_run", True),
                    "remove rule %s (%s/%s -> %s)" % (
                        rule.get("index"), rule.get("protocol"),
-                       rule.get("port"), rule.get("to-host")))
+                       rule.get("port"), rule.get("to-host")),
+                   "index", None, _probe)
 
 
 def tool_set_keendns_mapping(args):
@@ -346,9 +468,22 @@ def tool_set_keendns_mapping(args):
         "ssl": {"redirect": True},
         "security-level": {level: True},
     }
+
+    def _probe(after):
+        mapping = after.get(name) if isinstance(after, dict) else None
+        if not isinstance(mapping, dict):
+            return None
+        up = mapping.get("upstream")
+        if not isinstance(up, dict):
+            return None
+        p, h, pt = up.get("proto"), up.get("upstream"), up.get("port")
+        if p is None or h is None or pt is None:
+            return None
+        return "%s://%s:%s" % (p, h, pt)
     return _commit({"ip": {"http": {"proxy": {name: entry}}}}, "ip/http/proxy",
                    args.get("dry_run", True),
-                   "KeenDNS '%s' -> %s://%s:%s (%s)" % (name, proto, host, port, level))
+                   "KeenDNS '%s' -> %s://%s:%s (%s)" % (name, proto, host, port, level),
+                   "upstream", "%s://%s:%s" % (proto, host, port), _probe)
 
 
 def tool_remove_keendns_mapping(args):
@@ -360,9 +495,13 @@ def tool_remove_keendns_mapping(args):
     if isinstance(existing, dict) and name not in existing:
         return "No KeenDNS mapping named '%s'. Existing: %s" % (
             name, ", ".join(sorted(existing.keys())))
+
+    def _probe(after):
+        return name if isinstance(after, dict) and name in after else None
     return _commit({"ip": {"http": {"proxy": {name: {"no": True}}}}},
                    "ip/http/proxy", args.get("dry_run", True),
-                   "remove KeenDNS mapping '%s'" % name)
+                   "remove KeenDNS mapping '%s'" % name,
+                   "name", None, _probe)
 
 
 def tool_set_dhcp_host(args):
@@ -377,9 +516,16 @@ def tool_set_dhcp_host(args):
         if isinstance(entry, dict) and entry.get("ip") == ip and entry.get("mac") != mac:
             return ("Refused: %s is already reserved for %s. Free it first."
                     % (ip, entry.get("mac")))
+
+    def _probe(after):
+        for e in _entries(after):
+            if e.get("mac") == mac:
+                return e.get("ip")
+        return None
     return _commit({"ip": {"dhcp": {"host": {"mac": mac, "ip": ip}}}},
                    "ip/dhcp/host", args.get("dry_run", True),
-                   "reserve %s for %s" % (ip, mac))
+                   "reserve %s for %s" % (ip, mac),
+                   "ip", ip, _probe)
 
 
 def tool_remove_dhcp_host(args):
@@ -392,9 +538,16 @@ def tool_remove_dhcp_host(args):
                   if isinstance(e, dict) and e.get("mac") == mac), None)
     if not match:
         return "No static DHCP reservation for %s" % mac
+
+    def _probe(after):
+        for e in _entries(after):
+            if e.get("mac") == mac:
+                return e.get("mac")
+        return None
     return _commit({"ip": {"dhcp": {"host": {"mac": mac, "no": True}}}},
                    "ip/dhcp/host", args.get("dry_run", True),
-                   "remove reservation %s (%s)" % (match.get("ip"), mac))
+                   "remove reservation %s (%s)" % (match.get("ip"), mac),
+                   "mac", None, _probe)
 
 
 
@@ -431,9 +584,19 @@ def tool_set_dns_host(args):
                 "documented limit is %d" % (len(hosts), DNS_HOST_LIMIT))
     except GuardError as e:
         return "Refused: %s" % e
+
+    def _probe(after):
+        # A name can hold several addresses (round-robin) - search all of
+        # them, not just the first entry for this domain.
+        for e in _entries(after):
+            if (str(e.get("domain", "")).strip().rstrip(".").lower() == domain
+                    and e.get("address") == address):
+                return e.get("address")
+        return None
     return _commit({"ip": {"host": {"domain": domain, "address": address}}},
                    "ip/host", args.get("dry_run", True),
-                   "static DNS record %s -> %s" % (domain, address))
+                   "static DNS record %s -> %s" % (domain, address),
+                   "address", address, _probe)
 
 
 def tool_remove_dns_host(args):
@@ -459,9 +622,17 @@ def tool_remove_dns_host(args):
                 % (len(matches), domain,
                    ", ".join(str(h.get("address")) for h in matches)))
     rec = matches[0]
+
+    def _probe(after):
+        for e in _entries(after):
+            if (str(e.get("domain", "")).strip().rstrip(".").lower() == domain
+                    and e.get("address") == rec.get("address")):
+                return e.get("address")
+        return None
     return _commit({"ip": {"host": {"domain": rec.get("domain"),
                                     "address": rec.get("address"),
                                     "no": True}}},
                    "ip/host", args.get("dry_run", True),
                    "remove static DNS record %s -> %s"
-                   % (rec.get("domain"), rec.get("address")))
+                   % (rec.get("domain"), rec.get("address")),
+                   "address", None, _probe)
