@@ -5,3 +5,8 @@ __pycache__/
 *.pyc
 watch_rules.json
 CLAUDE.md
+*.bak
+*.bak.*
+*.orig
+*.rej
+*~

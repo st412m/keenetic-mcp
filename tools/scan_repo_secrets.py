@@ -37,13 +37,35 @@ SKIP_DIRS = {".git", "__pycache__", "node_modules"}
 # Extensions this script reads and scans for MAC/IP/base64 patterns.
 SCAN_EXTENSIONS = {".py", ".md", ".json", ".sh", ".example"}
 
-# Filenames that must never reach a commit, anywhere in the tree. This is
-# the actual fix for the 2026-09-12 incident: a file that is tracked, or
-# force-added past .gitignore, is still caught here because this check reads
-# git's own tracked/ignored state, not just the ignore rules on disk - see
-# _git_file_status. An untracked file that is ALSO gitignored is skipped;
-# see the module docstring.
-FORBIDDEN_FILENAMES = {"CLAUDE.md", ".env", "watch_rules.json"}
+# Filenames that must never reach a commit, anywhere in the tree, matched
+# exactly. This is the actual fix for the 2026-09-12 incident: a file that
+# is tracked, or force-added past .gitignore, is still caught here because
+# this check reads git's own tracked/ignored state, not just the ignore
+# rules on disk - see _git_file_status. An untracked file that is ALSO
+# gitignored is skipped; see the module docstring.
+FORBIDDEN_FILENAMES = {"CLAUDE.md"}
+
+# Prefixes that must never reach a commit, matched against the whole
+# filename with str.startswith - broader than FORBIDDEN_FILENAMES on
+# purpose. A *.bak / *.bak.<date> sibling an editor or a manual copy leaves
+# next to the real file is exactly as sensitive as the real file, and
+# .gitignore only stops it from being ADDED, not from being caught here if
+# it already made it into a commit (same gap as FORBIDDEN_FILENAMES, same
+# fix). Found the hard way 2026-09-19: .env.bak-2026-09-07,
+# watch_rules.json.bak.20260809 and .20260908 sat in a working tree on the
+# router, matched by neither .gitignore nor the old exact-match list.
+# ".env.example" is the one deliberate exception - it is the checked-in
+# template, not a leaked credential file.
+FORBIDDEN_PREFIXES = (".env", "watch_rules.json")
+FORBIDDEN_PREFIX_EXCEPTIONS = {".env.example"}
+
+
+def _is_forbidden_name(filename):
+    if filename in FORBIDDEN_FILENAMES:
+        return True
+    if filename in FORBIDDEN_PREFIX_EXCEPTIONS:
+        return False
+    return filename.startswith(FORBIDDEN_PREFIXES)
 
 # --- MAC addresses -----------------------------------------------------------
 #
@@ -209,7 +231,7 @@ def scan(root):
             # on its own, so it is not what this check exists to catch.
             continue
 
-        if filename in FORBIDDEN_FILENAMES:
+        if _is_forbidden_name(filename):
             violations.append(
                 "%s: filename '%s' must never be committed to this repo"
                 % (rel_path, filename))
