@@ -1,476 +1,22 @@
 # Keenetic MCP Server
 
-MCP (Model Context Protocol) server for Keenetic routers. Runs directly on the router via Entware. Allows Claude AI to monitor and manage your router.
-
-Tested on: **Keenetic Giga KN-1010 + KN-1011 (Mesh)**, KeeneticOS **5.1.5** (`5.01.C.5.0-0`), Entware `mipselsf`.
-
-Current version: **2.8.0** — 49 tools, no dependencies outside the Python standard library. Tools are reachable over MCP and, since 2.6.0, over plain HTTP for clients that do not speak the protocol (Home Assistant, curl, shell scripts). Since 2.7.0 the server can also push: a background watcher polls the router locally and makes an outbound HTTP call when a rule matches.
-
-## Available Tools
-
-### System Monitoring
-- `get_system_info` — firmware version, uptime, CPU load, memory usage. Also returns an `mcp` block with `mcp_server_version`, `uptime_human` and `boot_time` (exact reboot timestamp — useful because KN-1010 has no RTC and the log clock jumps at boot)
-- `get_internet_status` — internet connection status and external IP address
-- `get_interfaces` — all network interfaces status and configuration
-- `get_traffic` — top clients by traffic with total rx/tx summary
-- `get_vpn_status` — status of all VPN interfaces (WireGuard, IPsec, L2TP, PPTP) with peer details
-
-### WiFi
-- `get_wifi` — WiFi radio status: channel, bandwidth, bitrate, temperature, connected stations count
-- `get_wifi_stations` — currently connected WiFi stations with signal strength (RSSI), speed, traffic and mesh node (controller/extender)
-- `get_site_survey` — scan nearby WiFi networks
-- `get_channel_analysis` — analyze WiFi channel congestion and recommend the least busy channel for 2.4GHz and 5GHz
-
-### Clients
-- `get_clients` — all devices in the network with IP, MAC, signal, traffic and mesh node (controller/extender)
-- `get_unregistered_clients` — active devices not yet registered in the router (unknown devices)
-- `get_dhcp_leases` — devices with an active DHCP lease from the pool, including expiry time
-- `get_dhcp_static` — static DHCP reservations (`ip dhcp host`). Complements `get_dhcp_leases`: a device with a fixed binding does not appear as a pool lease
-- `register_client` — register a device by MAC, assign a name and optionally a static IP
-- `update_client` — update name or static IP of a registered device
-- `block_client` — block a device by MAC address (works for both registered and unregistered devices)
-- `unblock_client` — unblock a previously blocked device by MAC address
-
-### Configuration & network rules (read-only)
-- `get_config` — the router's `running-config` with an optional case-insensitive regex filter. Secrets (`md5`, `nthash`, `psk`, `password`, `private-key`, long base64 keys) are masked unless `include_secrets: true`
-- `get_config_state` — parsed `show/last-change`: when the config was last touched (given both in MSK and UTC), which agent and user touched it, and the `checksum` — the only reliable signal that a save has actually landed on disk. The raw `fail-safe` block is included as-is, but its `unsaved` field must **not** be branched on: it can read `false` while a save is still in flight. Compare `checksum` across two calls instead
-- `diff_saved_config` — diffs `running-config` against `startup-config`, both fetched as CLI text from the `/ci/` endpoints (outside `/rci/` entirely). Answers "what is not saved right now": it sees a difference for exactly as long as `checksum` still shows the old value, which is the whole save window (4–5 seconds on the tested hardware, see *Write tool response contract*) — not a guarantee of catching a specific just-made write, since a single MCP round trip rarely beats that window. `only_in_running` / `only_in_startup` are line lists; both empty means fully saved. Expect the config's own service header (`! $$$ Agent / Last change / Md5 / Username`) to show up in the diff whenever the two sides differ at all — that is normal, not an artifact. Secrets are masked on both sides before comparing. Not wired into the write tools — call it on demand
-- `get_port_forwarding` — port forwarding / static NAT rules (`ip static`)
-- `get_firewall_rules` — access-lists with their entries, `ip firewall` settings and interface access-groups
-- `get_keendns_mappings` — KeenDNS / web application access mappings (`ip http proxy`) with their upstreams
-- `get_dns_proxy` — DNS proxy status: upstream resolvers with their DoT SNI, the static A/AAAA records the router serves (parsed into domain/address/type rather than handed back as config lines), and the `ip host` config tree that `set_dns_host` / `remove_dns_host` write to, so a write can be verified without a second call. A missing `proxy-status` block is an error, not an empty list
-- `get_schedule` — router schedules (the firmware auto-update window, and any others) with their name, weekday/time actions and seconds until the next fire. The auto-update window is otherwise a hardcoded assumption in recovery automations — this reads it from the router. Unreadable trees produce an explicit **error**, never an empty list: the caller is usually deciding whether it may reboot the router, and "no window is configured" must not look like "I failed to read it". The weekday comes from the router's own resolved name (`Sat`); when only the config tree is available the day is reported as its raw number, because the numbering is undocumented and both common conventions fit the samples
-- `rci_query` — raw **read-only** query against the RCI tree: `GET /rci/show/<path>`, or `GET /rci/<path>` with `config_tree: true`. It cannot write, by construction — writing to RCI requires a POST body and this tool never sends one. Use the default tree for state (`ntp`, `components`, `ndns`, `interface/GigabitEthernet1`) and `config_tree` to inspect the exact write-shape of a settings branch (`ip/static`, `ip/http/proxy`, `ip/dhcp/host`). Schedules and the DNS proxy have their own named tools now. Blacklisted subtrees: `running-config` (use `get_config`), `crypto`, `ppp`, `user`. Output is capped at 40 000 characters
-
-### Configuration changes (write)
-
-Every tool below takes `dry_run`, and **it defaults to `true`**: the tool returns the exact payload it would send and changes nothing. A real write is followed by `system configuration save` (raw RCI writes do not survive a reboot without it) and by a re-read of the affected branch, so the answer contains a before/after diff rather than a "command sent" claim.
-
-- `set_port_forwarding` — create or update an `ip static` rule. The target is addressed by **MAC**, not IP: pass `to_host` as a MAC, or as the IP of a registered host, which is resolved for you and refused if the router does not know it (a typo would otherwise create a rule forwarding nowhere). Supports `to_port`, `end_port` (ranges), `comment` and `enable` — the last one being the per-rule `disable` flag
-- `remove_port_forwarding` — delete a rule by `index` (from `get_port_forwarding`) or by `port`. Ambiguous matches are refused rather than guessed
-- `set_keendns_mapping` / `remove_keendns_mapping` — manage `ip http proxy` entries: name → upstream host:port, published on the ndns domain with ssl redirect
-- `set_dhcp_host` / `remove_dhcp_host` — manage `ip dhcp host` reservations. An IP already reserved for a different MAC is refused. Note that the device *name* lives in the known-host tree — use `register_client` / `update_client` for that
-- `set_dns_host` / `remove_dns_host` — manage static DNS records (`ip host <domain> <address>`) served by the router's own DNS proxy. This is the LAN half of a split-horizon setup: public DNS sends a name to the WAN address, this record sends clients inside the network straight to the reverse proxy — one record per site, every time a site is added. `ip host` accepts several addresses for one name and would round-robin it, so a name that already resolves elsewhere is refused rather than extended: remove the old record first. Removal needs both name and address (the router's own `no ip host domain address` form), and the address is read from the config tree unless a name holds several. The documented ceiling of 64 records is checked before writing
-
-**Guard rails are in code, not in the description — and the list is yours to configure.** The server always protects *itself*, regardless of configuration and with no way to switch it off: its own port (`MCP_PORT`), the `127.0.0.1:<MCP_PORT>` upstream and the `keenetic-mcp` proxy name. A mistake therefore can never close the channel this server is reached through. Everything else you want shielded from the write tools goes in `.env`, comma-separated:
-
-- `MCP_PROTECTED_PORTS` — external ports that must not be forwarded or removed
-- `MCP_PROTECTED_PROXY_NAMES` — KeenDNS proxy names that must not be changed or removed
-- `MCP_PROTECTED_UPSTREAMS` — `host:port` upstreams that must not be pointed at
-
-A protected object is refused outright; if you genuinely need to change one, do it in the web interface. Leave the variables empty to protect only the server's own channel. See `.env.example` for the annotated list.
-
-**The refusal runs in both directions**, and that is easy to miss: a protected port cannot be removed *and* cannot be forwarded in the first place. So the list is not only "do not break what is running" — it is also "never publish this straight to the WAN again", which is what you want for services you have deliberately moved behind a reverse proxy. Ports that are not forwarded today still belong in the list for exactly that reason.
-
-The corollary is that a list written before a reverse proxy went in will protect the wrong things. Once every site and every API enters through `443` on one proxy, that single rule is worth more than any individual service port, and losing it takes everything down at once — so `80` and `443` belong in `MCP_PROTECTED_PORTS` from the moment the proxy exists. (KeenDNS setups are unaffected: cloud mode needs no forwarding at all, and in direct mode the router itself holds 80 and 443.)
-
-If a write tool refuses you, that is this list talking, not a malfunction. The message names the port or the object; the fix is either to change it in the web interface or to take it out of `.env` deliberately.
-
-### Write tool response contract
-
-Twelve tools write to the router: the four pairs above (`set_port_forwarding` / `remove_port_forwarding`, `set_keendns_mapping` / `remove_keendns_mapping`, `set_dhcp_host` / `remove_dhcp_host`, `set_dns_host` / `remove_dns_host`) plus `register_client`, `update_client`, `block_client` and `unblock_client` (see *How Client Management Works*). Since 2.8.0 all twelve answer with the same fields:
-
-- `errors` — only what the router itself returned (`status` / `code` / `ident` / `message`). Never a synthetic entry
-- `intent_error` — `null`, or `{field, requested, actual, message}` when the router accepted the write with no error but the tree still shows the old value: a silent no-op that `errors` alone cannot see, because the router never complained
-- `transport_error` — `null`, or the exception text when the connection dropped or timed out while reading the response. The write may well have reached the router in that case — there is no way to know — so this is kept separate from a genuine RCI error rather than folded into `errors`
-- `matches_intent` (bool) — whether the value now on the router equals what was actually **requested**, not whether it differs from what was there **before**. A write of the value that was already correct and a silently ignored write both read `changed: false`; `matches_intent` is what tells them apart, and it is what the tool's success is judged on
-- `changed` — informational only, not a success signal. A record that changed but still does not match what was requested is `changed: true` and a failed write at the same time
-- `save_attempted` (bool), alongside `config_saved` (bool, same type as before), `save_verified` (bool) and `save_detail` (the full object `_save_config` returns) — see below
-
-**`config_saved: true` no longer means what it meant before 2.8.0.** It used to mean "the save request was sent and nothing raised an exception" — which is also what it meant in the seconds before the router silently failed to save at all: the router answers a save error with HTTP 200 and a status block in the body, and earlier code never parsed that body. As of 2.8.0, `config_saved` is `true` only once the save request itself came back with no RCI error; `save_attempted` says whether a save was even tried (it is not, for example, when nothing actually landed); `save_verified` says whether the checksum on disk was actually seen to change.
-
-**`save_detail.status: "pending"` is a normal outcome, not an error.**
-
-- A save takes about 4–5 seconds on this hardware; the write tool polls up to `SAVE_VERIFY_TIMEOUT_MS` (7000ms — see the comment in `helpers.py` for why that number) and returns `pending` if the save has not landed by then.
-- `pending` means the write applied and the save is still settling — it is not a failure. Failures are `errors` (the router said no) and `intent_error` (the router said nothing and did nothing).
-- Polling blocks this single-threaded server, so the cap is finite by design, not "wait as long as it takes".
-- `fail-safe.unsaved` inside `show/last-change` is not a save indicator — it can read `false` while a save is still in flight. Compare `checksum` across two calls instead.
-- `show/last-change`'s `date` is stamped when a save starts; `checksum` changes when it finishes. `show/last-change` tracks `running-config` specifically.
-
-### Breaking change in 2.8.0
-
-`register_client`, `update_client`, `block_client` and `unblock_client` used to return a plain string. As of 2.8.0 they return the same JSON object described above, like every other write tool — there is no compatibility shim for the old text output, and none is planned. This does not get a major version bump: the precedent is 2.5.0, where splitting the monolithic `server.py` into eight modules was a considerably larger internal change and also stayed a minor release.
-
-### Diagnostics
-- `get_log` — system log with timestamps, optional line count, text filter and time window (`since` / `until`, accepting `HH:MM`, `HH:MM:SS` or `Jul 24 08:00`)
-- `get_log_by_device` — system log filtered by device MAC address, IP address or name
-- `run_ping` — ping a host directly from the router, returns latency and packet loss
-- `get_watch_status` — watcher state: rules file, per-rule poll interval, cooldown, seconds to the next poll, match/sent/failed counters and the last delivery error
-- `test_watch_rule` — render a watcher rule's outbound call with sample values (`dry_run` true by default) or actually send it, to prove the receiver is reachable from the router. Credentials in the rendered view are masked; the call itself uses the real values
-
-### Mesh
-- `get_mesh_nodes` — Mesh Wi-Fi nodes: controller and extenders with firmware, uptime and connection speed
-- `get_extender_log` — system log directly from mesh extender(s); extenders are discovered automatically, optional filter by IP, line count and text
-
-### Storage & Entware
-- `get_media` — internal flash and USB drives: partition UUID, label, filesystem, state, free space and which subsystem uses the partition (e.g. `opkg`). Use it to check whether the Entware drive is healthy
-- `get_opkg_status` — which drive OPKG is bound to, the initrc path, and whether `/opt` is **actually mounted**. If `opt_mounted` is false, the server you are talking to is running on borrowed time
-
-### Backups & management
-- `backup_config` — trigger a router config backup right now
-- `backup_mcp_config` — back up **this server's own** unversioned files (`.env`, `watch_rules.json`, the Entware init script) to the NAS. Runs synchronously and reports what happened — including a round-trip md5 check — rather than answering "started". See *Backing up the server's own configuration*
-- `list_backups` — list backup files already present on the NAS (`rsync --list-only`) — confirms the scheduled backups actually arrive
-- `dump_log` — snapshot the current router log and rsync it to the NAS backup path (RAM staging, no flash writes)
-- `reboot` — reboot the router
-
-### Security
-- `get_web_access` — web applications exposed to the internet via Keenetic DDNS, read from the generated nginx config. `get_keendns_mappings` shows the same thing from the other side (running-config) — comparing the two catches stale entries
-
-## Project structure
-
-As of 2.5.0 the server is split into flat modules in the repository root. This is a flat layout on purpose, not a Python package: `init.d` runs `python server.py` directly, so the script's directory is on `sys.path` and plain imports work with no change to how the addon starts.
-
-- `core.py` — `.env` loading, router authentication, the RCI client, and all mutable state (session cookie, protected-object sets)
-- `backup.py` — the config-backup scheduler and rsync, plus (2.7.3) the backup of the server's own unversioned files
-- `helpers.py` — running-config parsing, secret masking, log formatting
-- `tools_network.py` — read tools for clients, WiFi, interfaces, logs, VPN, DNS proxy, mesh
-- `tools_system.py` — system info, client management, ping, media/opkg, reboot, schedules
-- `tools_config.py` — running-config readers and the write tools, with the protection guards
-- `registry.py` — the tool table and dispatcher
-- `http_tools.py` — the plain-HTTP access policy and query-string argument coercion (added in 2.6.0; keeps the HTTP surface out of the registry and the tool modules)
-- `watcher.py` — the event watcher: rule loading, log and RCI polling, deduplication, templating and the outbound call (added in 2.7.0). It is the one module that registers its own tools instead of being listed in `registry.py`, so that adding a watcher touches neither the registry nor the tool modules
-- `server.py` — the HTTP / MCP transport and entry point
-
-Behaviour is identical across the split. Adding a tool means writing the function in the relevant `tools_*` module and registering it in `registry.py` — `watcher.py` is the deliberate exception, see above.
-
-**For contributors touching imports:** `import urllib.request` and `import urllib.error` in the same file bind the same name, `urllib`. If either submodule is used anywhere in the file, both imports look "used" to `pyflakes` and to `ruff check --select F` — only one half of the pair may actually be referenced, and the tools stay silent about the other. Verify this specific pair by hand: `grep -n 'urllib\.request\.'` and `grep -n 'urllib\.error\.'` against the file, separately, and check each import line against what the grep actually found.
-
-## Config Backup
-
-The server includes a built-in scheduler that automatically backs up the router configuration (`running-config`) via the RCI API.
-
-**How it works:**
-- A background thread checks the schedule every minute (no cron required)
-- Config is fetched via authenticated RCI API call
-- If `BACKUP_RSYNC_HOST` is set: config is written to `/tmp` (RAM) and synced to the remote host via rsync over SSH — the flash drive is never written to
-- If no rsync host is set: config is saved locally in `BACKUP_PATH` with rotation
-
-**To enable**, add to your `.env`:
-
-```
-BACKUP_ENABLED=true
-BACKUP_SCHEDULE=0 11 * * 0
-BACKUP_RSYNC_HOST=192.168.1.2
-BACKUP_RSYNC_USER=admin
-BACKUP_RSYNC_KEY=/opt/etc/keenetic-backup-rsa
-BACKUP_RSYNC_PATH=/share/backups/keenetic
-```
-
-**Schedule format** is standard cron: `minute hour day month weekday`
-
-```
-0 11 * * 0   — every Sunday at 11:00
-0 3  * * *   — every day at 03:00
-0 */6 * * *  — every 6 hours
-```
-
-**If using rsync**, install it first and set up SSH key authentication:
-
-```bash
-opkg install rsync
-ssh-keygen -t rsa -f /opt/etc/keenetic-backup-rsa
-cat /opt/etc/keenetic-backup-rsa.pub | ssh user@nas-host "mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys"
-```
-
-You can trigger a backup manually at any time via `backup_config`, and verify that files really landed on the NAS via `list_backups`.
-
-### Backing up the server's own configuration
-
-A router config backup does not save this server. Three files here are restored by
-neither `git pull` nor the router's own backup:
-
-| File | Why git cannot restore it |
-|---|---|
-| `.env` | gitignored — it holds the router password and your tokens |
-| `watch_rules.json` | gitignored — the example file is the one under version control |
-| `/opt/etc/init.d/S99keenetic-mcp` | installed by hand; a pull of the working copy never touches the installed copy |
-
-Losing them means reconstructing the watcher's rules from memory, and the USB
-stick they live on is the least reliable part of the setup. Since **2.7.3** they
-ride along with the router config on the same schedule. It needs no
-configuration: with an rsync destination set, `BACKUP_MCP_CONFIG` defaults to
-true.
-
-```
-BACKUP_MCP_CONFIG=true
-BACKUP_MCP_INIT=/opt/etc/init.d/S99keenetic-mcp
-```
-
-**Layout on the receiver** — a mirror plus a dated snapshot:
-
-```
-<BACKUP_RSYNC_PATH>/
-├── keenetic-config-YYYY-MM-DD.json     the router config
-├── mcp-config/                         always current, rewritten every run
-│   ├── .env  watch_rules.json  S99keenetic-mcp  manifest.json
-└── mcp-config-YYYY-MM-DD/              written ONLY when the content changed
-```
-
-A directory per run would mean 52 a year for a set that changes perhaps four
-times; a single overwritten directory would keep no history at all, which is
-the one thing a backup is for. The hybrid keeps both properties: a corrupted
-file *is* a change, so it creates its own snapshot and the last good state stays
-in the previous one. **Nothing is ever deleted on the receiver** — there is no
-rotation, deliberately, because rotation means handing a delete primitive to the
-process whose whole job is preservation. If the snapshots ever do pile up,
-delete them yourself.
-
-**Change detection** compares `manifest.json` inside the mirror: md5 of each
-file, plus its true size, mode and mtime. No state file is written to the USB
-stick, and mtimes are not used to decide anything — a file restored by a plain
-`cp` carries the copy's mtime, not the original's, and an mtime comparison would
-then fire on identical content. The manifest is also what makes the backup
-self-describing: it says when each file was last edited even if the transport
-loses that.
-
-**Verification is part of the run, not an afterthought.** After sending, the
-mirror is read back off the receiver and md5-compared against what was staged;
-the result is the `verified` field. A backup tool that answers "started" is
-exactly how you come to believe in a backup that is not happening — so
-`backup_mcp_config` runs synchronously and returns:
-
-```json
-{
-  "ok": true,
-  "first_run": false,
-  "changed": false,
-  "mirror": "/share/backups/keenetic/mcp-config/",
-  "snapshot": null,
-  "verified": true,
-  "files": [
-    {"name": ".env", "size": 1251, "mode": "0600", "mtime": "2026-08-03 22:18:01"}
-  ],
-  "error": null
-}
-```
-
-Staging is in `/tmp` (tmpfs/RAM) — the flash drive is not written to. The whole
-set is a few kilobytes, so the run costs a second or two.
-
-Two things are deliberately **not** in the set. The rsync private key
-(`BACKUP_RSYNC_KEY`): it regenerates in a minute, and storing it on the share it
-unlocks buys nothing. And `running-config` itself, which has its own file.
-
-⚠️ The set contains credentials in clear text. Restrict the share to a single
-account. Note also that `.env` arrives as a dot-file: busybox `ls -l` does not
-list it, and Samba hides it from Windows Explorer by default (`hide dot files`),
-so it can look missing when it is not. Verify with `ls -la`, with
-`rsync --list-only`, or simply with `list_backups`.
-
-## Plain HTTP endpoints
-
-Besides the MCP protocol (POST `/<MCP_SECRET>`), the server answers a few plain
-`GET` requests, authenticated by the same secret token in the URL path. They
-exist for clients that cannot speak MCP — Home Assistant's `rest` sensor,
-`rest_command` and `command_line`, cron jobs, plain `curl`.
-
-### Calling tools over HTTP
-
-```
-GET /<MCP_SECRET>/tool/<name>?arg=value
-GET /<MCP_SECRET>/tools
-```
-
-`/tool/<name>` runs the same function the MCP client would and answers with
-
-```json
-{"ok": true, "tool": "get_system_info", "args": {}, "result": { ... }}
-```
-
-Most tools return a JSON document; it is parsed into `result` rather than nested
-as a string, so a template can index into it directly. Add `&raw=1` to get the
-tool's own text as `text/plain` instead — convenient for `command_line` sensors
-and for reading logs by eye. `/tools` lists what is servable right now, with
-parameter names, declared types and a `mutating` flag.
-
-**This route is read-only by default, and that is deliberate.** A secret in a
-URL is a weak credential: it lands in `configuration.yaml`, in automation
-traces, in shell history and in any proxy log along the way. So the 15 tools
-that change state — all six write tools plus `reboot`, `register_client`,
-`update_client`, `block_client`, `unblock_client`, `backup_config`,
-`backup_mcp_config`, `dump_log` and `test_watch_rule` — answer **403** here no
-matter what. The remaining 30 read tools are served. To lift the gate for a
-specific tool, name it explicitly:
-
-    MCP_HTTP_TOOL_ALLOWLIST=register_client
-
-Setting `MCP_HTTP_TOOLS=false` turns the whole route off; `/reboot` and the MCP
-protocol are unaffected by both variables.
-
-Arguments are coerced using each tool's declared `inputSchema`, not by guessing
-from the text — a value that does not fit its declared type is a **400** with an
-explanation, never a silently wrong call:
-
-```
-$ curl 'http://192.168.1.1:9584/SECRET/tool/get_log?lines=zzz'
-{"ok": false, "tool": "get_log", "error": "parameter 'lines' must be an integer, got 'zzz'"}
-```
-
-Unknown and missing parameters are 400 as well, and the error lists what the
-tool accepts. Booleans take `true/false`, `1/0`, `yes/no` or `on/off`.
-
-⚠️ The server is single-threaded: it handles one request at a time, so a busy
-polling loop will block MCP calls. Keep `scan_interval` at 60 s or more, and
-keep the slow tools (`get_log`, which allows the router 30 s to answer,
-`get_site_survey`, `get_channel_analysis`) out of anything that polls.
-
-### Reboot endpoint
-
-```
-GET /<MCP_SECRET>/reboot
-```
-
-It runs the same `reboot` tool (`system reboot` over RCI) and returns
-`{"ok": true, "log_synced": <bool>, "result": "Reboot command sent"}`. Protected
-by the same secret token in the URL path. This endpoint predates the tool route
-and stays separate from it — rebooting a router is not something that should
-share a URL shape with reading a sensor.
-
-Before rebooting, the endpoint first snapshots the current router log and rsyncs
-it to the NAS backup path (see Config Backup) so the pre-reboot log survives the
-reboot. The snapshot is staged in `/tmp` (tmpfs/RAM) — no writes to the USB
-flash. If the NAS backup is not configured the dump is skipped and the reboot
-still proceeds; `log_synced` reports the result. The same snapshot can be taken
-on demand, without rebooting, via the `dump_log` MCP tool.
-
-Intended for automated recovery — e.g. a Home Assistant `rest_command` that
-reboots the router on a WAN outage. Use the **LAN IP**, not the DDNS host, so it
-works while the uplink is down:
-
-```
-curl http://192.168.1.1:9584/YOUR_MCP_SECRET/reboot
-```
-
-⚠️ Reboots the router immediately — no confirmation step.
-
-### Home Assistant examples
-
-A REST sensor that tracks the WAN address, and a shell-style sensor that reads
-the log:
-
-```yaml
-sensor:
-  - platform: rest
-    name: Router WAN
-    resource: http://192.168.1.1:9584/YOUR_MCP_SECRET/tool/get_internet_status
-    value_template: "{{ value_json.result[0].address }}"
-    json_attributes_path: "$.result[0]"
-    json_attributes: [uptime, defaultgw, priority]
-    scan_interval: 300
-
-rest_command:
-  router_reboot:
-    url: http://192.168.1.1:9584/YOUR_MCP_SECRET/reboot
-```
-
-Use the **LAN IP** rather than the DDNS host in automations that are meant to
-survive an outage — the DDNS name goes through the uplink you are trying to
-recover.
-
-## Event watcher
-
-Everything above is pull: something asks the router a question. The watcher is push. A background thread polls the router **locally** and, when a rule matches, makes an outbound HTTP call. The point is the reversal: a poll from outside has to be slow enough not to hammer a single-threaded server, so a ten-second event is noticed a minute late, if at all. From inside, ten seconds is cheap.
-
-The watcher has no idea who it is talking to. A rule carries a complete HTTP call — method, URL, headers, body — so a home-automation webhook, ntfy, the Telegram Bot API and a log collector are all equal receivers. There is no integration with any of them to configure.
-
-### Rules
-
-Rules live in one JSON file on the router: `watch_rules.json` next to `server.py` (override with `MCP_WATCH_RULES`). Copy `watch_rules.example.json` and edit. The file is re-read when its mtime changes — no restart. There is no web interface and none is planned.
-
-```json
-{
-  "defaults": {
-    "method": "POST",
-    "url": "http://192.168.1.54:8123/api/webhook/keenetic_watch",
-    "body": {"text": "${message}"},
-    "cooldown": 60
-  },
-  "rules": [
-    {
-      "id": "vpn_login",
-      "source": "log",
-      "match": "Vpn::EventSender: \"([^\"]+)\": user \"([^\"]+)\" connected from \"([^\"]+)\"",
-      "message": "VPN login: ${m2} from ${m3}"
-    },
-    {
-      "id": "unknown_device",
-      "source": "rci",
-      "path": "show/ip/hotspot",
-      "key": "mac",
-      "where": {"active": true, "registered": false},
-      "message": "Unknown device ${mac} (${ip}, '${name}')"
-    }
-  ]
-}
-```
-
-A rule inherits everything it does not set from `defaults`, which is what keeps a working rule down to three or four lines.
-
-**Common fields:** `id`, `source` (`log` or `rci`), `enabled` (default true), `interval` seconds between polls (log: `MCP_WATCH_INTERVAL`, default 10; rci: 30), `cooldown` seconds (default 60), `max_events` per poll (default 5), `method`, `url`, `headers`, `body`, `timeout` (default 10), `proxy`, `verify_ssl`, `message`.
-
-**`source: "log"`** — `match` is a regex against the formatted log line; `exclude` is an optional counter-regex. Capture groups arrive as `${m1}`…`${m9}`, named groups under their own names, plus `${line}`, `${text}`, `${label}`, `${ident}`, `${log_time}`. Cooldown for a log rule is **per rule**: one login writes several lines, and the useful limit is "at most once every N seconds", not "once per distinct wording".
-
-Check that the event you want is actually written before building a rule on it — and check whether the firmware has to be told to write it. **Authentication logging is off by default on KeeneticOS 5.1.1** (observed then; not re-checked on 5.1.5). Turn it on once and it survives reboots:
-
-```
-ip http log auth
-system configuration save
-```
-
-From an Entware shell the same two commands go through `ndmc -c '...'`, run under a normal ssh login — not under `exec sh`, which fails with `ndmc: system failed [0xcffd0060]`. Typing `ip http log auth` directly in an Entware shell hits busybox `ip`, not the router CLI.
-
-With it on, the router logs both halves of a web-configurator login, with the source address:
-
-```
-Core::Scgi::Auth::Handler: opened session for user "admin" from "192.168.1.41".
-Core::Scgi::Auth::Handler: authentication failed for user "admin" from "192.168.1.41".
-```
-
-Two authentication channels write under different prefixes, which is worth knowing before writing a regex. `Core::Scgi::Auth::Handler` covers the web configurator **and RCI**, so this server's own logins land there too, from the router's own LAN address. `Core::Authenticator: user "admin" authenticated ... tag "cli"` is the telnet/SSH channel and is written whether or not `log auth` is on. Brute-force bans need no switch at all: `Netfilter::Util::BfdManager: "Http": ban remote host <IP> for 15 minutes`, with a matching unban.
-
-Earlier versions of this file said a web-configurator login was not logged at all, on 5.1.1, ever. That was wrong — the switch was simply off. The format also differs from Keenetic's own documentation, which shows a session id in the `opened session` line; on 5.1.1 there is none. Match the string your own log actually contains.
-
-Logged without any switch: `Vpn::EventSender: ... connected from` for remote access, with user and source IP, and `Core::System::StartupConfig: saving (http/rci)` when settings are saved — the latter fires for this server's own write tools too, since the log does not say who asked, while a change made through `ndmc` writes `saving (cli)` instead. Beware also of `Core::Authenticator: user "admin" tagged with "http"`: that is the config being replayed at boot, so a rule matching `tag "http"` alone fires on every reboot.
-
-The `config_saved_not_mcp` rule is the mirror of `router_config_saved`: it matches the same `StartupConfig: saving (...)` line but excludes `saving (http/rci)`, so it fires on a save made from the router's own CLI or through `ndmc` — not from the web configurator, and not from this server. That exclusion is also the rule's ceiling, and it is irreducible: a human editing over the web writes `http/rci` too, exactly like keenetic-mcp's own write tools do, and nothing distinguishes the two — not the log line, not the `agent` field in `show/last-change` either. It is enabled by default, unlike most rules here, because it never fires on this server's own writes and so adds no noise on a normal install.
-
-**`source: "rci"`** — `path` is an RCI path (`show/ip/hotspot`), `key` is the field identifying an item (`mac`), `where` / `where_not` select which items count, `on` is any of `appear` (default), `disappear`, `change`, and `change` compares the fields in `track`. Every field of the matched item is a placeholder, nested ones flattened with underscores (`${interface_name}`) and also exposed under their short name when nothing else claims it (`${ap}` for `mws_ap`). Cooldown here is **per item**.
-
-**Substitution** is `string.Template.safe_substitute`: an unknown `${name}` is left in the text rather than raising or silently emptying, so a typo shows up in the message instead of disappearing. When `body` is an object it is sent as JSON and the escaping is done by the JSON encoder — which is why the Telegram example passes text through a JSON body and not a hand-built string.
-
-**Secrets:** `$NAME` in a `url`, a header, the `proxy` or the `body` is expanded from the environment when the file is loaded, so a bot token, a proxy password and a chat id can live in `.env` and stay out of the rules file. Only **UPPERCASE** names are taken from the environment; event fields are lowercase, so the two namespaces cannot collide and a stray `HOME` in the environment can never eat a `${message}`. `watch_rules.json` is gitignored either way — and, since 2.7.3, included in the backup of the server's own configuration, because gitignored also means unrecoverable.
-
-**`proxy`** is optional and per rule. Without it the call goes out directly — no proxy handler is even constructed, and there is no global proxy setting anywhere. It takes a full HTTP-proxy URL, credentials included (`http://user:pass@host:port`) — `urllib` sends `Proxy-Authorization` on the `CONNECT`, so an authenticated proxy works without any extra code. It has to be an HTTP proxy: SOCKS needs a library outside the standard library, and this project has no dependencies. Many SOCKS endpoints also speak HTTP on the same port — a mixed inbound does — so a proxy meant for something else is often reusable here. Use it when the router itself cannot reach the receiver: a bot API blocked upstream is exactly this case, and it is the difference between an alert that arrives when the rest of the house is down and one that does not. Put it in `defaults` only when *every* receiver needs it; a rule posting to a machine on the LAN must not inherit a proxy that sends the request abroad and back.
-
-Note that the proxy does not decrypt anything — `CONNECT` forwards bytes and TLS stays end to end — so the certificate is still verified by the router's own python. If HTTPS fails on certificate verification, the router is missing a CA store (`opkg install ca-certificates`); `"verify_ssl": false` exists as a last resort and should be treated as one.
-
-### What it does not confuse itself with
-
-- **Position in the log is found by content, not by number.** The log is a RAM ring buffer: after a reboot the numbering restarts, and the lines written before NTP answers carry a date restored from flash that can be days off. Neither the index nor the timestamp can be trusted, so the watcher remembers the hashes of the last few lines and looks for them in the next poll. When it cannot find them — reboot, or a burst larger than the buffer — it adopts the current tail as the new baseline and reports nothing, rather than replaying a whole boot as news.
-- **The first sight of an RCI rule is a baseline, not an event.** Otherwise every restart would announce everything that is already there.
-- **State lives in `/tmp`** (`MCP_WATCH_STATE`), i.e. in RAM. Writing it to the USB stick is the one thing this project does not do. The cost is that a router reboot resets the baseline: a device that was already connected before the reboot becomes part of the new normal. A restart of the server alone keeps its state.
-- **The watcher has its own RCI session.** It authenticates as its own client and guards its own cookie with a private lock, so it never touches `core.rci_lock` and a poll cannot delay an MCP call. This is not how 2.7.0 worked: there the watcher shared the server's session, and since `show log` costs six to seven seconds on a KN-1010 against a ten-second poll, the lock was held about two thirds of the time. What a session cannot fix is the cost of `show log` itself — `get_log` still takes ten seconds or so, and still belongs nowhere near a polling loop. One visible side effect: the watcher authenticates over HTTP like any other RCI client, so with `ip http log auth` enabled its login appears as `Core::Scgi::Auth::Handler: opened session for user "admin" from "<the router's own LAN address>"` at startup and on session renewal — not under `Core::Authenticator`, which is the CLI/SSH channel. A rule matching web logins will see it, so exclude the router's own address unless you want to hear about it
-
-### Checking it works
-
-```bash
-# is it running, and what has it seen
-curl -s "http://192.168.1.1:9584/<MCP_SECRET>/tool/get_watch_status" | head -40
-
-# render a rule's outbound call without sending anything
-curl -s "http://192.168.1.1:9584/<MCP_SECRET>/tool/test_watch_rule?rule_id=vpn_login"
-```
-
-`test_watch_rule` with `dry_run=false` actually sends — it is in the mutating set, so over HTTP it needs `MCP_HTTP_TOOL_ALLOWLIST`. Over MCP it is available directly.
+MCP (Model Context Protocol) server for Keenetic routers. It runs directly on the router via Entware, with no dependencies outside the Python standard library. It gives an AI assistant 49 tools for monitoring and managing the router, reachable over MCP and over plain HTTP, plus a background watcher that calls out from the router when a rule matches.
 
 ## Requirements
 
-- Keenetic router with Entware support
-- USB drive formatted as ext4
-- Entware installed on the USB drive
-- Python 3.x (standard library only — `requirements.txt` lists no external packages)
+| Item | Requirement |
+|---|---|
+| Router | Keenetic with Entware support |
+| Storage | USB drive formatted as ext4, Entware installed on it |
+| Python | Python 3.x, standard library only (`requirements.txt` lists no packages) |
+| Port | 9584 by default |
 
-Tested arch **mipsel** (KN-1010/1011, KN-1810, KN-1910, KN-2310, KN-3810). Should also work on **mips** arch (KN-2410, KN-2510, KN-2010, KN-2110, KN-3610).
+| Architecture | Models | Status |
+|---|---|---|
+| mipsel | KN-1010/1011, KN-1810, KN-1910, KN-2310, KN-3810 | Tested |
+| mips | KN-2410, KN-2510, KN-2010, KN-2110, KN-3610 | Should work, not tested |
+
+Tested on Keenetic Giga KN-1010 + KN-1011 (Mesh), KeeneticOS 5.1.5 (`5.01.C.5.0-0`), Entware `mipselsf`.
 
 ## Installation
 
@@ -478,24 +24,20 @@ Tested arch **mipsel** (KN-1010/1011, KN-1810, KN-1910, KN-2310, KN-3810). Shoul
 
 Format a USB drive as ext4 and plug it into the router. In the router web interface go to Applications -> OPKG and make sure the drive is selected as the storage.
 
-Download the installer for your router model and copy it to the `install` folder on the USB drive via SMB (\\192.168.1.1):
+Download the installer for the router model and copy it to the `install` folder on the USB drive via SMB (`\\192.168.1.1`):
 
-For KN-1010/1011, KN-1810, KN-1910, KN-2310, KN-3810:
-https://bin.entware.net/mipselsf-k3.4/installer/mipsel-installer.tar.gz
-
-For KN-2410, KN-2510, KN-2010, KN-2110, KN-3610:
-https://bin.entware.net/mipssf-k3.4/installer/mips-installer.tar.gz
+- KN-1010/1011, KN-1810, KN-1910, KN-2310, KN-3810: https://bin.entware.net/mipselsf-k3.4/installer/mipsel-installer.tar.gz
+- KN-2410, KN-2510, KN-2010, KN-2110, KN-3610: https://bin.entware.net/mipssf-k3.4/installer/mips-installer.tar.gz
 
 Entware installs automatically. Check the router system log for:
-[5/5] Installation of the "Entware" package system is complete!
+
+    [5/5] Installation of the "Entware" package system is complete!
 
 ### Step 2 — SSH into the router
 
-After Entware is installed, connect via SSH on port 222:
-
     ssh root@192.168.1.1 -p 222
 
-Default password: keenetic. Change it immediately:
+Default password: `keenetic`. Change it immediately:
 
     passwd
 
@@ -512,33 +54,6 @@ Default password: keenetic. Change it immediately:
     cp .env.example .env
     nano .env
 
-Fill in your credentials in `.env`:
-
-    KEENETIC_HOST=http://192.168.1.1
-    KEENETIC_USER=admin
-    KEENETIC_PASS=your_router_password
-    MCP_SECRET=some_random_secret_string
-    MCP_PORT=9584
-
-Optionally, tell the write tools what else to protect besides their own channel
-(see the *Configuration changes* section and `.env.example`):
-
-    MCP_PROTECTED_PORTS=80,443,8123,9583
-    MCP_PROTECTED_PROXY_NAMES=ha-mcp,homeassistant
-
-The plain-HTTP tool route is on by default and read-only. Both variables below
-can be omitted entirely; set them only to narrow or widen that (see *Plain HTTP
-endpoints*):
-
-    MCP_HTTP_TOOLS=true
-    MCP_HTTP_TOOL_ALLOWLIST=
-
-The watcher stays idle until you give it rules. To turn it on, copy the example
-and edit it (see *Event watcher*):
-
-    cp watch_rules.example.json watch_rules.json
-    nano watch_rules.json
-
 ### Step 5 — Set up autostart
 
     cp init.d/S99keenetic-mcp /opt/etc/init.d/
@@ -554,18 +69,15 @@ Verify it is running:
 
 In the Keenetic web interface go to Network Rules -> Domain name -> Web application access and click Add:
 
-- Name: keenetic-mcp
+- Name: `keenetic-mcp`
 - Internet access: Open access
 - Device: This Keenetic device
 - Protocol: HTTP
 - TCP Port: 9584
 
-Your MCP server will be available at:
-https://keenetic-mcp.YOUR_DDNS.keenetic.link/YOUR_MCP_SECRET
-
 ### Step 7 — Connect to Claude
 
-In Claude.ai go to Settings -> Integrations -> Add custom connector and paste the URL from Step 6.
+See [Connecting to claude.ai](#connecting-to-claudeai).
 
 ### Updating
 
@@ -574,146 +86,106 @@ In Claude.ai go to Settings -> Integrations -> Add custom connector and paste th
     /opt/etc/init.d/S99keenetic-mcp restart
     /opt/etc/init.d/S99keenetic-mcp status
 
-`.env` is in `.gitignore`, so a pull never touches your credentials. So is
-`watch_rules.json` — the example file is the one under version control. The
-autostart script itself is not updated by a pull of the working copy — after a
-release that changes it, copy it over again from `init.d/`. All three are exactly
-what `backup_mcp_config` preserves, for the same reason.
+`.env` and `watch_rules.json` are gitignored, so a pull never touches credentials or rules. The autostart script is not updated by a pull of the working copy — after a release that changes it, copy it over again from `init.d/`. All three are what `backup_mcp_config` preserves.
 
-After adding or removing tools, **start a new chat** — MCP clients cache
-`tools/list` for the lifetime of a session, and toggling the connector inside an
-existing chat is not enough. To check the tool list without a client:
+After adding or removing tools, start a new chat: MCP clients cache `tools/list` for the lifetime of a session.
 
-    curl -s -X POST http://localhost:9584/YOUR_MCP_SECRET \
-         -H 'Content-Type: application/json' \
-         -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+## Configuration
 
-## How Client Management Works
+Settings live in `.env` next to `server.py`, read once at startup. The minimum:
 
-- `get_unregistered_clients` shows devices that connected to your network but were never named or registered
-- `get_dhcp_leases` shows devices that received an IP from the DHCP pool with time until lease expires; `get_dhcp_static` shows fixed bindings, which never appear as leases
-- `register_client` assigns a name and optional static IP to a device
-- `block_client` denies network access to a device. If the device is not yet registered, it will be registered automatically as "Blocked Device" before blocking
-- `unblock_client` restores access with permit rule
-- Blocking does not disconnect the device from WiFi and does not stop it from getting a DHCP lease — it cuts off internet and LAN access at the firewall level
-- Registration lives in the `known host` tree (`Core::KnownHosts`), not in `ip hotspot host`, and every mutation is followed by `system configuration save` — otherwise the change would not survive a reboot
+    KEENETIC_HOST=http://192.168.1.1
+    KEENETIC_USER=admin
+    KEENETIC_PASS=your_router_password
+    MCP_SECRET=some_random_secret_string
+    MCP_PORT=9584
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `KEENETIC_HOST` / `KEENETIC_USER` / `KEENETIC_PASS` | `http://192.168.1.1`, `admin` | Router connection for RCI |
+| `MCP_SECRET` / `MCP_PORT` | `changeme`, `9584` | Secret token in the URL path, and the listening port |
+| `MCP_PROTECTED_PORTS` | empty | External ports the write tools must never forward or remove |
+| `MCP_PROTECTED_PROXY_NAMES` | empty | KeenDNS proxy names the write tools must never change |
+| `MCP_PROTECTED_UPSTREAMS` | empty | `host:port` upstreams the write tools must never point at |
+| `MCP_HTTP_TOOLS` | `true` | Plain-HTTP tool route on or off |
+| `MCP_HTTP_TOOL_ALLOWLIST` | empty | State-changing tools allowed over that route |
+| `MCP_WATCH` / `MCP_WATCH_RULES` | `true`, `watch_rules.json` | Event watcher, and its rules file |
+| `BACKUP_ENABLED` / `BACKUP_SCHEDULE` | `false`, `0 11 * * 0` | Scheduled router config backup, in cron format |
+| `BACKUP_RSYNC_HOST` / `_USER` / `_KEY` / `_PATH` | empty | rsync-over-SSH destination; without it backups stay local |
+| `BACKUP_MCP_CONFIG` | `true` | Also back up `.env`, `watch_rules.json` and the init script |
+
+Full reference, including the protected-object rules: [docs/configuration.md](docs/configuration.md).
+
+The watcher stays idle until it has rules. To turn it on, copy the example and edit it:
+
+    cp watch_rules.example.json watch_rules.json
+    nano watch_rules.json
+
+## Connecting to claude.ai
+
+After Step 6 the server is reachable at:
+
+    https://keenetic-mcp.YOUR_DDNS.keenetic.link/YOUR_MCP_SECRET
+
+In Claude.ai go to Settings -> Integrations -> Add custom connector and paste that URL.
+
+## Tools
+
+49 tools. One line per group; full descriptions in [docs/tools.md](docs/tools.md).
+
+- **System** — `get_system_info`, `get_internet_status`, `get_interfaces`, `get_traffic`, `get_vpn_status`
+- **WiFi** — `get_wifi`, `get_wifi_stations`, `get_site_survey`, `get_channel_analysis`
+- **Clients** — `get_clients`, `get_unregistered_clients`, `get_dhcp_leases`, `get_dhcp_static`, `register_client`, `update_client`, `block_client`, `unblock_client`
+- **Config, read-only** — `get_config`, `get_config_state`, `diff_saved_config`, `get_port_forwarding`, `get_firewall_rules`, `get_keendns_mappings`, `get_dns_proxy`, `get_schedule`, `rci_query`
+- **Config, write** — `set_port_forwarding`, `remove_port_forwarding`, `set_keendns_mapping`, `remove_keendns_mapping`, `set_dhcp_host`, `remove_dhcp_host`, `set_dns_host`, `remove_dns_host`
+- **Diagnostics** — `get_log`, `get_log_by_device`, `run_ping`, `get_watch_status`, `test_watch_rule`
+- **Mesh** — `get_mesh_nodes`, `get_extender_log`
+- **Storage** — `get_media`, `get_opkg_status`
+- **Backups and management** — `backup_config`, `backup_mcp_config`, `list_backups`, `dump_log`, `reboot`
+- **Security** — `get_web_access`
+
+Every write tool takes `dry_run`, defaulting to `true`: it returns the payload it would send and changes nothing.
+
+Beyond MCP, the tools are also reachable as `GET /<MCP_SECRET>/tool/<name>?arg=value` — see [docs/http-api.md](docs/http-api.md). The push side, where the router calls out on a matching event, is [docs/watcher.md](docs/watcher.md). Backups are [docs/backup.md](docs/backup.md).
+
+## Limitations
+
+- The server is single-threaded: it handles one request at a time, so a polling loop blocks MCP calls. Keep poll intervals at 60 s or more
+- `get_log` allows the router 30 s to answer and typically takes around ten. `get_site_survey` and `get_channel_analysis` are also slow. None of them belong in a polling loop
+- A write tool polls for up to 7 s waiting for the save to land on disk, then answers `pending` rather than claiming success
+- MCP clients cache `tools/list` for the lifetime of a session. A changed tool list needs a new chat
+- The plain-HTTP route serves read-only tools only. State-changing tools return 403 unless allowlisted
+- The watcher keeps its state in `/tmp` (RAM), so a router reboot resets its baseline
+- `mips` architecture is untested. `mipsel` is tested on KeeneticOS 5.1.5; other firmware branches are not
+- Log timestamps from before NTP syncs are wrong. `get_log` flags them but a `since`/`until` window still matches them
 
 ## Troubleshooting
 
-**The connector is dead and port 9584 does not answer.** First check whether the
-server is even running — most often `/opt` itself is not mounted, which means
-`server.py` was never started:
+| Symptom | Command |
+|---|---|
+| Port 9584 does not answer | `/opt/etc/init.d/S99keenetic-mcp status` then `grep ' /opt ' /proc/mounts` |
+| `Address already in use`, old version answers | `/opt/etc/init.d/S99keenetic-mcp status` — it reports every live instance |
+| Nothing in the log | `cat /tmp/keenetic-mcp.log` |
 
-    /opt/etc/init.d/S99keenetic-mcp status
-    grep ' /opt ' /proc/mounts
+⚠️ If `/opt` is not mounted, never rebind the OPKG drive over SSH on the router itself: `dropbear` lives on `/opt` and the rebind kills the session before it completes. Use the web interface or another machine.
 
-If `/opt` is not mounted, rebind the OPKG drive: web interface -> OPKG package
-manager -> Storage -> select "not selected" -> save -> select the drive again ->
-save. This remounts `/opt` and re-runs `rc.unslung`. A router reboot is not
-needed. The same thing over RCI, from another host:
+More symptoms: [docs/troubleshooting.md](docs/troubleshooting.md).
 
-    POST /rci/  {"opkg":{"disk":{"no":true}}}
-    POST /rci/  {"opkg":{"disk":{"disk":"USB:/"}}}
+## Security
 
-⚠️ **Never rebind over SSH on the router itself.** `dropbear` lives on `/opt` and
-is started from `rc.unslung`; the first command kills your own session and the
-second one never runs, leaving `/opt` unmounted. Do it from the web interface or
-from another machine.
-
-**`Address already in use` in the log, and an old version answers on the port.**
-An orphaned instance is still holding the socket — `/opt` being rebound spawns a
-second `server.py` and overwrites the pid-file, so the previous process survives
-(python keeps its inode across the unmount). The init script handles this
-itself: `stop` and `restart` also kill processes matched in `/proc` (by a python
-`argv[0]` whose command line contains the server path — a shell that merely
-mentions it is never matched), and `start` cleans up before spawning. Check
-with:
-
-    /opt/etc/init.d/S99keenetic-mcp status
-
-`status` reports every live instance and warns if more than one is running. If
-you are upgrading from a build whose init script predates this, copy the current
-`init.d/S99keenetic-mcp` over by hand once — a `git pull` of the working copy
-does not replace the one already installed under `/opt/etc/init.d/`.
-
-**Nothing in the log at all.** Server output goes to `/tmp/keenetic-mcp.log`
-(RAM, truncated at 256 KB, marked with `=== <date> start ===`), and python runs
-with `-u` so a crashing process does not take its traceback with it. `/tmp` is
-cleared on reboot by design — nothing is ever written to the USB flash.
-
-**A watcher rule never fires.** Ask the watcher itself before suspecting the
-rule: `get_watch_status` reports whether the thread is running, whether the
-rules file parsed, when each rule last matched, and the last delivery error.
-A rule that matches but cannot deliver shows up as `failed` with the error
-attached; `test_watch_rule` with `dry_run=false` proves the receiver is
-reachable from the router, which is a different question from whether the event
-happened.
-
-**`backup_mcp_config` reports a file as skipped.** It warns to syslog and backs
-up what it found rather than failing the run. Usually the init script lives
-somewhere else — point `BACKUP_MCP_INIT` at it. `"error": "rsync target not
-configured"` means the `BACKUP_RSYNC_*` block is missing: the set has nowhere to
-go, and there is no local fallback for it by design, since the whole point is
-getting the files off this flash drive.
-
-## Notes
-
-- All 49 tools tested on live NDMS 5.1.5
-- `get_wifi` uses `show interface` (`show wireless` endpoint removed in NDMS 5.x)
-- `get_traffic` aggregates rx/tx from active clients and shows top 10 by usage
-- `get_channel_analysis` uses site survey data to recommend least congested channel
-- `get_log_by_device` resolves device name/IP to MAC for more accurate log matching
-- `get_log` timestamps can lie right after a reboot, and the tool now says so. The router logs from the moment it powers on, but its clock is only correct once NTP answers — everything in between carries a time restored from flash, which can be days off. Since 2.6.0 `get_log` compares timestamps against the router's uptime and prefixes its output with `[!] N of these entries are stamped BEFORE this boot` when it finds impossible dates. Look for `Ntp::Client: time synchronized` in the log to see exactly where real time starts. A `since`/`until` window will happily match those bogus dates, because as far as the filter is concerned they are just older entries
-- A log line with no parsable timestamp inherits the timestamp of the line above it rather than being dropped from a `since`/`until` window (before 2.6.0 such lines vanished silently)
-- `get_schedule` merges the runtime view (`show/schedule` — next fire, seconds left, the day resolved to a name) with the human-readable name from the config tree; `get_dns_proxy` parses the proxy-config for upstream resolvers and static records. There is no `show/clock` or `show/update` endpoint on NDMS 5.x — the current firmware string lives in `get_system_info`
-- `rci()` returns the **whole RCI envelope**, so a POST for `{"show": {"x": {}}}` answers `{"show": {"x": ...}}` and the payload has to be unwrapped: `result.get("show", {}).get("x", {})`. `_rci_get()` does not — `GET /rci/show/x` returns the payload bare. The two shapes are easy to confuse, and a tool that forgets the unwrap does not crash: it quietly finds nothing and reports an empty result, which reads as "the router has none of these". That is what happened to `get_schedule` and `get_dns_proxy` between 2.5.0 and 2.7.3, and it survived a manual cross-check because `rci_query` uses the GET form and showed the data
-- Static DNS records live in two places that do not look alike: `ip host` in the config tree (what `set_dns_host` writes, `{domain, address}` objects) and `static_a` / `static_aaaa` lines inside the DNS proxy's generated config (what the proxy actually serves, including records the router creates for itself). `get_dns_proxy` returns both. The trailing number on a `static_a` line is the router's own flag and is **not** a reliable marker of "user-created" — cloud-agent records have been seen carrying the same value as manual ones — so it is passed through unread
-- The `dow` numbering in the schedule config tree is not documented as either Sunday=0 or Monday=1, and the only sample available (`6` for Saturday) is consistent with both. `get_schedule` therefore reports the day name only where the router itself resolved one, and otherwise passes the number through as `dow_number`
-- Mesh extender clients are fully visible in `get_clients` and `get_wifi_stations` — each device includes a `node` field (`controller` or `extender`) indicating which mesh node it is connected to
-- `get_extender_log` authenticates on each extender node independently using the same credentials as the controller; extenders are discovered dynamically from the hotspot table — no hardcoded IPs
-- Port forwarding, firewall rules, static DHCP bindings and KeenDNS mappings are not exposed as RCI `show` endpoints in NDMS 5.x, but they are all present in `running-config` — which is what `get_port_forwarding`, `get_firewall_rules`, `get_dhcp_static` and `get_keendns_mappings` parse
-- Port forwarding targets are addressed by **MAC**, not by IP (`ip static tcp GigabitEthernet1 8123 aa:bb:cc:dd:ee:ff`)
-- `disable` in an `ip static` rule is a **per-rule attribute**, not a global switch for the whole block. In `running-config` it is emitted as a separate `ip static disable` line that continues the *preceding* rule, which reads like a global directive and is not one — confirm with `rci_query path='ip/static' config_tree=true`, where the flag sits inside its own rule object
-- Backup scheduler runs in a background thread — no cron or external tools needed
-- The backup of the server's own configuration rides the same scheduled run, but its outcome does not change the router-config backup's result — a verification automation watching for `keenetic-config-*.json` must not start reporting failure because of a second, unrelated transfer
-- File copies for that backup use `shutil.copy2`, so the mirror carries the originals' mtime and mode rather than the moment of copying — the backup can then still say when a file was last edited
-- PID file, server log and watcher state live in `/tmp` (RAM) — no flash writes at runtime
-- The watcher runs in a second background thread alongside the backup scheduler. With no rules file it does not start at all and says so in syslog
-
-## Security Notes
-
-- The endpoint is protected by a secret token in the URL path
-- HTTPS is handled by Keenetic built-in SSL certificate
+- The endpoint is protected by a secret token in the URL path. HTTPS is handled by the Keenetic built-in SSL certificate
+- Never commit `.env` — it is in `.gitignore`. Change the default SSH password after installation
 - `rci_query` is GET-only and cannot modify the router; `crypto`, `ppp`, `user` and `running-config` subtrees are refused outright
-- `get_config` masks secrets by default; `include_secrets: true` is opt-in and will put passwords and keys into the chat transcript
-- The write tools always protect the server's own port, upstream and proxy name; add anything else via `MCP_PROTECTED_*` in `.env`. Protection applies to creating a rule as well as removing one, so listing a port also forbids re-publishing that service to the WAN
-- `set_dns_host` is not covered by `MCP_PROTECTED_*` — there is no protected-names variable for DNS records. What guards an existing record is that a name already resolving elsewhere is refused: moving one takes a deliberate `remove_dns_host` first. If a name matters enough that it must never move at all, keep it out of reach by not exposing the write tools over the HTTP route (they are refused there by default)
-- The plain-HTTP tool route serves read-only tools only. State-changing tools are refused with 403 unless named in `MCP_HTTP_TOOL_ALLOWLIST` — treat adding one as handing out a write key, because the URL secret ends up in config files, automation traces and proxy logs
-- Anything reachable over MCP is reachable over the tool route with the same secret. If that is not what you want, run `MCP_HTTP_TOOLS=false`
-- A watcher rule is an outbound HTTP call the router makes on its own. Treat `watch_rules.json` as credential material — it can carry bot tokens and internal URLs. It is in `.gitignore`; prefer `$NAME` placeholders resolved from `.env`
-- `backup_mcp_config` copies `.env` and `watch_rules.json` to the backup destination in clear text. Restrict that share to one account, and note that the transfer does not go through the write tools' protection list — it is a file copy, not a router change. The rsync private key is excluded from the set on purpose: it is the key to the very share the backup sits on
-- `test_watch_rule` masks credentials in what it renders — bot tokens, proxy passwords, `Authorization` headers — by value against the environment and by pattern. Masking applies to the report, not to the call: `dry_run: false` sends the real thing, which is why the tool sits in the mutating set
-- Rule matches are logged to syslog by rule id, never with the matched line, so a message body does not end up in the router log
-- Never commit `.env` — it is in `.gitignore`
-- Change the default SSH password after installation
+- `get_config` masks secrets by default. `include_secrets: true` puts passwords and keys into the chat transcript
+- The write tools always protect the server's own port, upstream and proxy name. Add anything else via `MCP_PROTECTED_*`. Protection applies to creating a rule as well as removing one, so listing a port also forbids re-publishing that service to the WAN
+- `set_dns_host` is not covered by `MCP_PROTECTED_*`. What guards an existing record is that a name already resolving elsewhere is refused
+- The plain-HTTP route serves read-only tools only. Adding a tool to `MCP_HTTP_TOOL_ALLOWLIST` hands out a write key: the URL secret ends up in config files, automation traces and proxy logs. `MCP_HTTP_TOOLS=false` turns the route off
+- Treat `watch_rules.json` as credential material — it can carry bot tokens and internal URLs. Prefer `$NAME` placeholders resolved from `.env`
+- `backup_mcp_config` copies `.env` and `watch_rules.json` to the backup destination in clear text. Restrict that share to one account
+- `test_watch_rule` masks credentials in what it renders, not in what it sends: `dry_run: false` sends the real values
 
-## Changelog
+## Links
 
-- **2.8.0** — honest save confirmation and intent verification across all twelve write tools, two new read tools, a repository CI check, and an import cleanup left over from the 2.5.0 split, 47 -> 49 tools. `_save_config()` no longer treats "no exception" as "saved": the router can answer a save error with HTTP 200 and a status block the old code never parsed, and the save itself can still be settling seconds after the request returns. It now polls `show/last-change`'s checksum, capped at `SAVE_VERIFY_TIMEOUT_MS`, and reports `confirmed` or an honest `pending` instead of guessing; see *Write tool response contract*. All twelve write tools — the eight through `_commit` and `register_client` / `update_client` / `block_client` / `unblock_client` — now compare the state after a write against what was actually **requested**, not against the state before it: a write of an already-correct value and a silently ignored write used to look identical (`changed: false` either way). The new `matches_intent` field is what tells them apart, and `register_client` / `update_client` / `block_client` / `unblock_client` return JSON now instead of a string to carry it — a breaking change, see *Breaking change in 2.8.0*. New read tools: `get_config_state` (parsed `show/last-change`, with a warning that its `fail-safe.unsaved` field is not reliable) and `diff_saved_config`, which diffs running-config against startup-config as CLI text via the `/ci/running-config.txt` / `/ci/startup-config.txt` endpoints outside `/rci/` — a second, checksum-independent way to see what is not saved right now. `watch_rules.example.json` gains `config_saved_not_mcp`, which catches a config save made from the router's own CLI or through `ndmc`; it cannot catch a human editing over the web, because that writes identically to this server's own saves and the two cannot be told apart. `tools/scan_repo_secrets.py` plus a GitHub Actions workflow fail CI on a real MAC, a real private IP, or a forbidden filename (`CLAUDE.md`, `.env`, `watch_rules.json`) anywhere in the checked-out tree — the actual fix for `.gitignore` alone not stopping a file like that from reaching a public tag; a file that is gitignored but genuinely untracked is skipped, so a local run stays quiet on files that will never be committed. Also: every module still carried the full stdlib import header copied wholesale during the 2.5.0 split; removed what `ruff check --select F` and `pyflakes` flagged, plus a pattern neither tool sees on its own — `import urllib.request` and `import urllib.error` bind the same name, so using either submodule hides the other's unused import from both tools. Verified on Keenetic Giga KN-1010, KeeneticOS 5.1.5
-- **2.7.4** — two read tools that were quietly returning nothing, and static DNS records become writable, 45 -> 47 tools. `get_schedule` reported `actions: []` for a schedule that plainly had actions, alongside a phantom entry `{"id": "show", "name": null}`; `get_dns_proxy` answered `No DNS proxy status returned` on a router serving nine static records. One bug behind both: `rci()` returns the whole RCI envelope and neither tool unwrapped it, so each searched the envelope for keys that live one level down. Nothing raised — they just found nothing, and an empty answer from a read tool is indistinguishable from an empty router. `get_schedule` now treats an unreadable tree as an **error**, because its caller is typically deciding whether it may reboot the router and would otherwise read a failure as "no maintenance window exists, any time is fine". Where only the config tree answers, the weekday is reported as a raw number rather than a name: the numbering is undocumented and the available samples fit both conventions. New write tools `set_dns_host` / `remove_dns_host` manage `ip host` records — the LAN half of split-horizon, previously the one routine operation that still had to be done by hand for every site added behind a reverse proxy. `ip host` takes multiple addresses per name, so a name that already resolves elsewhere is refused instead of silently round-robined; removal sends both name and address, which is the form the router's own `no ip host` requires. Both are in the mutating set and refused over the plain-HTTP route unless allowlisted. `.env.example` adds `80,443` to `MCP_PROTECTED_PORTS` and the README now says out loud that the protection also forbids *creating* a rule — which is what makes listing an unforwarded port meaningful
-- **2.7.3** — the server's own unversioned files are backed up too, 44 -> 45 tools. `.env`, `watch_rules.json` and the Entware init script are restored by neither `git pull` nor a router config backup — the first two are gitignored, the third is edited by hand — so until now they survived only as a manual copy someone had to remember to make. They now ride the same scheduled rsync run as `running-config`. Storage is a hybrid: a `mcp-config/` mirror rewritten every run, plus a dated `mcp-config-YYYY-MM-DD/` snapshot written **only when the content changed** — a directory per run would mean 52 a year for a set that changes about four times, and a single overwritten directory would keep no history at all. Change detection compares `manifest.json` inside the mirror on the receiver: no state file is written to the USB stick, and mtimes decide nothing, since a file restored with a plain `cp` carries the copy's mtime and would look changed forever. There is no rotation, deliberately — nothing here deletes anything on the receiver. The new `backup_mcp_config` tool runs synchronously and reports the outcome, including a round-trip md5 check of what actually landed, rather than answering "started"; it is in the mutating set, so the plain-HTTP route refuses it without an allowlist entry. Copies use `shutil.copy2`, so mtime and mode survive. The rsync private key is excluded: it regenerates in a minute, and storing it on the share it unlocks buys nothing
-- **2.7.2** — fixes log polling, which 2.7.1 broke: `GET /rci/show/log` answers 404, and the router's log exists only as the POST form `{"show": {"log": {}}}`. The watcher now keeps two clients on its single session — GET for RCI rules, POST for the log. Also keeps the proxy host and port readable when masking a rendered rule (`http://***:***@host:port`): which proxy a failed delivery went through is the thing you need to see, the password is not
-- **2.7.1** — the watcher stops sharing `core.rci_lock`, and `test_watch_rule` stops printing secrets. Measured on a KN-1010: `show log` costs six to seven seconds and the watcher polls it every ten, so under 2.7.0 the shared lock was held about two thirds of the time — a `get_system_info` that answers in 50 ms took 6–7 s on roughly half the attempts, 60 calls back to back took 33 s with 14 s and 7 s gaps, and `get_log` took 15–20 s. That lock only ever protected one shared `session_cookie`, so the watcher now authenticates as its own client and guards its own cookie with its own private lock; the router holds concurrent RCI sessions without complaint and `show log` is I/O, so the server keeps answering throughout. After: 60 calls in 4 s, no gaps. Separately, `test_watch_rule` rendered the bot token and the proxy password in clear text while being reachable over the plain-HTTP route — the rendered view is now masked by value (credential-looking `UPPERCASE` names from the environment) and by pattern, with `Authorization`-style headers blanked by name; the call itself still sends the real values. `get_watch_status` gains an `rci_session` block. ⚠️ Broken release — its log source returns 404; use 2.7.2
-- **2.7.0** — the universal watcher, 42 -> 44 tools. A background thread polls the router locally and makes an outbound HTTP call when a rule matches, turning "ask the router every minute" into "the router tells you in ten seconds". Two event sources: log lines by regex, and appear/disappear/change diffs on any RCI branch. Rules are one JSON file on the router, re-read on mtime change, with a `defaults` block that keeps a working rule to three or four lines; substitution is `string.Template.safe_substitute`, no templating engine involved. Nothing in the code knows what a receiver is — a webhook, ntfy and the Telegram Bot API are the same thing to it. Log position is tracked by line content rather than by the log's own numbering, because that numbering restarts on reboot and pre-NTP timestamps are wrong; when the position is lost the current tail becomes the baseline and nothing is reported. New tools `get_watch_status` and `test_watch_rule`. `core.rci_lock` now serialises the shared session cookie between the watcher thread, the backup thread and the HTTP server
-- **2.6.0** — plain-HTTP access to the tools, for clients that cannot speak MCP. `GET /<MCP_SECRET>/tool/<name>?arg=value` runs any tool and answers JSON (`&raw=1` for the tool's own text); `GET /<MCP_SECRET>/tools` lists what is servable. **Read-only by default:** the 13 state-changing tools return 403 unless named in the new `MCP_HTTP_TOOL_ALLOWLIST`; `MCP_HTTP_TOOLS=false` disables the route entirely. Arguments are coerced from each tool's declared `inputSchema`, so a bad type is an explicit 400 rather than a silently wrong call. The policy lives in a new `http_tools.py` — the registry and tool modules are untouched. Also fixes two `get_log` papercuts: lines with no parsable timestamp are no longer dropped from a `since`/`until` window, and output is flagged when it contains entries stamped before the current boot (pre-NTP clock)
-- **2.5.0** — modular refactor + configurable protection, 40 -> 42 tools. `server.py` is split into focused modules (`core`, `backup`, `helpers`, `tools_network`, `tools_system`, `tools_config`, `registry`, and a thin `server`) with identical behaviour. The write-tool protection list moves from hardcoded to `.env` (`MCP_PROTECTED_PORTS` / `MCP_PROTECTED_PROXY_NAMES` / `MCP_PROTECTED_UPSTREAMS`); the server's own port, `127.0.0.1:<port>` upstream and `keenetic-mcp` name are always protected automatically. Two new read tools: `get_schedule` (router schedules, incl. the firmware auto-update window) and `get_dns_proxy` (upstream resolvers with DoT SNI + static records)
-- **2.4.0** — write tools, 34 -> 40: `set_port_forwarding` / `remove_port_forwarding`, `set_keendns_mapping` / `remove_keendns_mapping`, `set_dhcp_host` / `remove_dhcp_host`, all with `dry_run` defaulting to true, a coded protected list, `system configuration save` after every write and a before/after verification read. `rci_query` gained `config_tree` for read-only inspection of settings branches
-- **2.3.0** — observability release, 25 -> 34 tools: `rci_query`, `get_config`, `get_port_forwarding`, `get_firewall_rules`, `get_dhcp_static`, `get_keendns_mappings`, `get_media`, `get_opkg_status`, `list_backups`; `get_system_info` reports the MCP server version, human-readable uptime and boot time; `get_log` accepts `since`/`until`
-- **2.2.2** — client registration fixed: registration lives in `known host`, static IP in `ip dhcp host`, every mutation followed by `system configuration save`
-- **2.2.0** — `dump_log` (log snapshot -> rsync to NAS, RAM staging); the `/reboot` endpoint snapshots the log before rebooting
-- **2.1.0** — `GET /<MCP_SECRET>/reboot` HTTP endpoint for automated WAN-outage recovery
-- **2.0.0** — refactor, per-tool functions, `node` field (controller/extender), `get_extender_log`, built-in backup scheduler
-
-## License
-
-MIT
+- [docs/](docs/) — [configuration](docs/configuration.md), [tools](docs/tools.md), [HTTP API](docs/http-api.md), [watcher](docs/watcher.md), [backups](docs/backup.md), [troubleshooting](docs/troubleshooting.md), [internals](docs/internals.md)
+- [CHANGELOG.md](CHANGELOG.md) — version history
+- [LICENSE](LICENSE) — MIT
