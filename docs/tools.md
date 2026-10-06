@@ -107,6 +107,18 @@ A write of a value that was already correct and a silently ignored write both re
 - `fail-safe.unsaved` inside `show/last-change` is not a save indicator: it can read `false` while a save is still in flight. Compare `checksum` across two calls instead
 - `show/last-change`'s `date` is stamped when a save starts; `checksum` changes when it finishes. `show/last-change` tracks `running-config` specifically
 
+## Tool annotations
+
+Every tool in `tools/list` carries a `title` and MCP `annotations` with all four hints set explicitly: `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`. A client uses them to decide what to ask the user to confirm.
+
+A hint describes the worst case of a real call. `dry_run` is not taken into account: a tool that defaults to `dry_run=true` is annotated by what it does with `dry_run=false`.
+
+- **Destructive** (`destructiveHint: true`) — `set_port_forwarding`, `remove_port_forwarding`, `set_keendns_mapping`, `remove_keendns_mapping`, `set_dhcp_host`, `remove_dhcp_host`, `remove_dns_host`, `register_client`, `update_client`, `block_client`, `unblock_client`, `reboot`, `backup_config`, `backup_mcp_config`, `test_watch_rule`. "Create or update" counts as destructive, because an update overwrites the previous value
+- **Writing, not destructive** — `set_dns_host`, which only adds a record and refuses a name that already resolves elsewhere, and `dump_log`, which writes a new timestamped file on every call
+- **Open world** (`openWorldHint: true`) — `run_ping` and `test_watch_rule`, whose target is an arbitrary host or URL. The router, the mesh extenders and the NAS configured in `.env` count as a closed domain
+
+Every other tool is read-only. The annotations are advice to the client, not a gate: what the plain-HTTP route refuses is decided by the explicit mutating set in `http_tools.py` (see [http-api.md](http-api.md#read-only-by-default)), and a test checks that the two agree.
+
 ## Diagnostics
 
 - `get_log` — system log with timestamps, optional line count, text filter and time window (`since` / `until`, accepting `HH:MM`, `HH:MM:SS` or `Jul 24 08:00`)

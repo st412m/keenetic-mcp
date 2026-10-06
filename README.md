@@ -88,7 +88,7 @@ See [Connecting to claude.ai](#connecting-to-claudeai).
 
 `.env` and `watch_rules.json` are gitignored, so a pull never touches credentials or rules. The autostart script is not updated by a pull of the working copy — after a release that changes it, copy it over again from `init.d/`. All three are what `backup_mcp_config` preserves.
 
-After adding or removing tools, start a new chat: MCP clients cache `tools/list` for the lifetime of a session.
+After adding or removing tools, or after a release that changes tool titles or annotations, start a new chat: MCP clients cache `tools/list` for the lifetime of a session.
 
 ## Configuration
 
@@ -153,7 +153,7 @@ Beyond MCP, the tools are also reachable as `GET /<MCP_SECRET>/tool/<name>?arg=v
 - The server is single-threaded: it handles one request at a time, so a polling loop blocks MCP calls. Keep poll intervals at 60 s or more
 - `get_log` allows the router 30 s to answer and typically takes around ten. `get_site_survey` and `get_channel_analysis` are also slow. None of them belong in a polling loop
 - A write tool polls for up to 7 s waiting for the save to land on disk, then answers `pending` rather than claiming success
-- MCP clients cache `tools/list` for the lifetime of a session. A changed tool list needs a new chat
+- MCP clients cache `tools/list` for the lifetime of a session. A changed tool list, including changed titles or annotations, needs a new chat
 - The plain-HTTP route serves read-only tools only. State-changing tools return 403 unless allowlisted
 - The watcher keeps its state in `/tmp` (RAM), so a router reboot resets its baseline
 - `mips` architecture is untested. `mipsel` is tested on KeeneticOS 5.1.5; other firmware branches are not

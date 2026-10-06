@@ -15,10 +15,12 @@ The server is a set of flat modules in the repository root. It is not a Python p
 | `tools_system.py` | System info, client management, ping, media/opkg, reboot, schedules |
 | `tools_config.py` | running-config readers and the write tools, with the protection guards |
 | `registry.py` | The tool table and dispatcher |
+| `toolmeta.py` | `meta()`: the tool title and MCP annotations. Must stay free of imports — `registry.py` and `watcher.py` both import it |
 | `http_tools.py` | The plain-HTTP access policy and query-string argument coercion, kept out of the registry and the tool modules |
 | `watcher.py` | The event watcher: rule loading, log and RCI polling, deduplication, templating and the outbound call |
 | `server.py` | The HTTP / MCP transport and entry point |
-| `tools/scan_repo_secrets.py` | Repository secret scan, run by the GitHub Actions workflow in `.github/workflows/` |
+| `tools/scan_repo_secrets.py` | Repository secret scan, run by the `scan.yml` GitHub Actions workflow |
+| `tests/` | `unittest` tests for the tool annotations and the MCP transport, run by the `tests.yml` workflow. They import the modules without a router or network: `python -m unittest discover -s tests -v` |
 
 ## Adding a tool
 
@@ -26,7 +28,11 @@ A tool is a function in the relevant `tools_*` module, registered in `registry.p
 
 `watcher.py` is the exception: it registers its own tools instead of appearing in `registry.py`, so a change to the watcher touches neither the registry nor the tool modules.
 
-A tool that changes state must also be added to `MUTATING_TOOLS` in `http_tools.py`. A tool absent from that set is served over the plain-HTTP route as read-only.
+Every tool entry carries `**meta(title, read_only=..., destructive=..., idempotent=..., open_world=...)` from `toolmeta.py`, with all four hints given explicitly. The rules for choosing them are in [tools.md](tools.md#tool-annotations).
+
+A tool that changes state must also be added to `MUTATING_TOOLS` in `http_tools.py`. A tool absent from that set is served over the plain-HTTP route as read-only. The set is written out by hand, not derived from the annotations.
+
+`tests/test_annotations.py` checks both: every tool has a title and four boolean hints matching the expected table, and `readOnlyHint: false` holds for exactly the tools in `MUTATING_TOOLS`. A new tool fails the test until it is added to that table too.
 
 ## The RCI envelope
 

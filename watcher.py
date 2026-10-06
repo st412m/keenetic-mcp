@@ -105,6 +105,7 @@ except ImportError:  # python built without ssl - https rules will say so
 import core
 from backup import syslog
 from helpers import _format_log_line, _parse_log_dict
+from toolmeta import meta
 
 
 # --- tunables ---------------------------------------------------------------
@@ -1100,6 +1101,7 @@ def tool_test_watch_rule(args):
 
 WATCH_TOOLS = {
     "get_watch_status": {
+        **meta("Get watcher status", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": (
             "Watcher status: whether the background event watcher is running, which "
             "rules file it read, the state of its own RCI session, and per rule - "
@@ -1111,6 +1113,7 @@ WATCH_TOOLS = {
         "fn": tool_get_watch_status,
     },
     "test_watch_rule": {
+        **meta("Test watcher rule", read_only=False, destructive=True, idempotent=False, open_world=True),
         "description": (
             "Render a watcher rule's outbound HTTP call with sample event values, so "
             "the URL, headers and body can be inspected before a real event fires. "

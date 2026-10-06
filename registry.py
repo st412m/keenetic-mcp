@@ -1,10 +1,12 @@
 from tools_config import tool_diff_saved_config, tool_get_config, tool_get_config_state, tool_get_dhcp_static, tool_get_firewall_rules, tool_get_keendns_mappings, tool_get_port_forwarding, tool_rci_query, tool_remove_dhcp_host, tool_remove_dns_host, tool_remove_keendns_mapping, tool_remove_port_forwarding, tool_set_dhcp_host, tool_set_dns_host, tool_set_keendns_mapping, tool_set_port_forwarding
 from tools_network import tool_get_channel_analysis, tool_get_clients, tool_get_dhcp_leases, tool_get_extender_log, tool_get_interfaces, tool_get_internet_status, tool_get_log, tool_get_log_by_device, tool_get_mesh_nodes, tool_get_site_survey, tool_get_traffic, tool_get_unregistered_clients, tool_get_vpn_status, tool_get_web_access, tool_get_wifi, tool_get_wifi_stations, tool_get_dns_proxy
 from tools_system import tool_backup_config, tool_backup_mcp_config, tool_block_client, tool_dump_log, tool_get_media, tool_get_opkg_status, tool_get_system_info, tool_list_backups, tool_reboot, tool_register_client, tool_run_ping, tool_unblock_client, tool_update_client, tool_get_schedule
+from toolmeta import meta
 
 
 WRITE_TOOLS = {
     "set_port_forwarding": {
+        **meta("Set port forwarding rule", read_only=False, destructive=True, idempotent=False, open_world=False),
         "description": (
             "Create or update a port forwarding rule ('ip static'). The target is "
             "addressed by MAC: pass to_host as a MAC, or as an IP that belongs to a "
@@ -27,6 +29,7 @@ WRITE_TOOLS = {
         "fn": tool_set_port_forwarding,
     },
     "remove_port_forwarding": {
+        **meta("Remove port forwarding rule", read_only=False, destructive=True, idempotent=True, open_world=False),
         "description": (
             "Delete a port forwarding rule, selected by index (from "
             "get_port_forwarding) or by port. Refuses ambiguous matches and "
@@ -41,6 +44,7 @@ WRITE_TOOLS = {
         "fn": tool_remove_port_forwarding,
     },
     "set_keendns_mapping": {
+        **meta("Set KeenDNS mapping", read_only=False, destructive=True, idempotent=True, open_world=False),
         "description": (
             "Create or update a KeenDNS web-access mapping ('ip http proxy'): "
             "name -> upstream host:port, published on the ndns domain with ssl "
@@ -58,6 +62,7 @@ WRITE_TOOLS = {
         "fn": tool_set_keendns_mapping,
     },
     "remove_keendns_mapping": {
+        **meta("Remove KeenDNS mapping", read_only=False, destructive=True, idempotent=True, open_world=False),
         "description": "Delete a KeenDNS mapping by name. Protected names are refused. dry_run is TRUE by default.",
         "inputSchema": {"type": "object", "properties": {
             "name": {"type": "string", "description": "Mapping name"},
@@ -66,6 +71,7 @@ WRITE_TOOLS = {
         "fn": tool_remove_keendns_mapping,
     },
     "set_dhcp_host": {
+        **meta("Set static DHCP reservation", read_only=False, destructive=True, idempotent=True, open_world=False),
         "description": (
             "Create or update a static DHCP reservation ('ip dhcp host'). Refuses "
             "an IP already reserved for a different MAC. The device NAME lives in "
@@ -80,6 +86,7 @@ WRITE_TOOLS = {
         "fn": tool_set_dhcp_host,
     },
     "remove_dhcp_host": {
+        **meta("Remove static DHCP reservation", read_only=False, destructive=True, idempotent=True, open_world=False),
         "description": "Delete a static DHCP reservation by MAC. dry_run is TRUE by default.",
         "inputSchema": {"type": "object", "properties": {
             "mac": {"type": "string", "description": "MAC address"},
@@ -88,6 +95,7 @@ WRITE_TOOLS = {
         "fn": tool_remove_dhcp_host,
     },
     "set_dns_host": {
+        **meta("Add static DNS record", read_only=False, destructive=False, idempotent=True, open_world=False),
         "description": (
             "Create a static DNS record ('ip host <domain> <address>') served by "
             "the router's own DNS proxy - the LAN half of a split-horizon setup, "
@@ -106,6 +114,7 @@ WRITE_TOOLS = {
         "fn": tool_set_dns_host,
     },
     "remove_dns_host": {
+        **meta("Remove static DNS record", read_only=False, destructive=True, idempotent=True, open_world=False),
         "description": (
             "Delete a static DNS record ('no ip host <domain> <address>'). The "
             "address is looked up in the config tree, because the router's removal "
@@ -124,31 +133,37 @@ WRITE_TOOLS = {
 
 TOOLS = {
     "get_system_info": {
+        **meta("Get system info", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Get router system info: version, uptime, CPU, memory",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_system_info,
     },
     "get_clients": {
+        **meta("List clients", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Get list of connected clients (devices) in the network. Each client includes a 'node' field (controller/extender) indicating which mesh node it is connected to.",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_clients,
     },
     "get_unregistered_clients": {
+        **meta("List unregistered clients", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Get list of active but unregistered (unknown) devices in the network",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_unregistered_clients,
     },
     "get_dhcp_leases": {
+        **meta("List DHCP leases", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Get list of devices with active DHCP leases including expiry time",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_dhcp_leases,
     },
     "get_interfaces": {
+        **meta("Get interfaces", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Get network interfaces status and traffic stats",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_interfaces,
     },
     "get_log": {
+        **meta("Read router log", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Get system log entries with timestamps. Supports an optional time window via since/until ('HH:MM', 'HH:MM:SS' or 'Jul 24 08:00').",
         "inputSchema": {"type": "object", "properties": {
             "lines": {"type": "integer", "description": "Number of lines (default 50)"},
@@ -156,6 +171,7 @@ TOOLS = {
         "fn": tool_get_log,
     },
     "get_log_by_device": {
+        **meta("Read log by device", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Get system log entries filtered by device MAC address, IP address or name",
         "inputSchema": {"type": "object", "properties": {
             "device": {"type": "string", "description": "MAC address, IP address or device name"},
@@ -164,46 +180,55 @@ TOOLS = {
         "fn": tool_get_log_by_device,
     },
     "get_wifi": {
+        **meta("Get Wi-Fi status", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Get WiFi radio status: channel, bandwidth, bitrate, temperature, connected stations count",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_wifi,
     },
     "get_wifi_stations": {
+        **meta("List Wi-Fi stations", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Get currently associated WiFi stations with signal strength, traffic, device name and mesh node (controller/extender)",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_wifi_stations,
     },
     "get_traffic": {
+        **meta("Get traffic summary", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Get traffic summary for all active network interfaces (rx/tx bytes)",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_traffic,
     },
     "get_internet_status": {
+        **meta("Get internet status", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Get internet connection status and external IP",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_internet_status,
     },
     "get_site_survey": {
+        **meta("Scan nearby Wi-Fi networks", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Scan and list nearby WiFi networks",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_site_survey,
     },
     "get_channel_analysis": {
+        **meta("Analyze Wi-Fi channels", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Analyze WiFi channel congestion and recommend the least busy channel",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_channel_analysis,
     },
     "get_vpn_status": {
+        **meta("Get VPN status", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Get status of all VPN interfaces (WireGuard, IPsec, L2TP, PPTP)",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_vpn_status,
     },
     "get_web_access": {
+        **meta("List published web apps", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Get list of web applications exposed to the internet via Keenetic DDNS",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_web_access,
     },
     "run_ping": {
+        **meta("Ping host", read_only=True, destructive=False, idempotent=True, open_world=True),
         "description": "Ping a host from the router and return latency and packet loss",
         "inputSchema": {"type": "object", "properties": {
             "host": {"type": "string", "description": "Host or IP to ping"},
@@ -212,6 +237,7 @@ TOOLS = {
         "fn": tool_run_ping,
     },
     "register_client": {
+        **meta("Register client", read_only=False, destructive=True, idempotent=True, open_world=False),
         "description": "Register a device by MAC address, assign a name and optionally a static IP",
         "inputSchema": {"type": "object", "properties": {
             "mac": {"type": "string", "description": "MAC address, e.g. aa:bb:cc:dd:ee:ff"},
@@ -221,6 +247,7 @@ TOOLS = {
         "fn": tool_register_client,
     },
     "update_client": {
+        **meta("Update client", read_only=False, destructive=True, idempotent=True, open_world=False),
         "description": "Update name or static IP of a registered device",
         "inputSchema": {"type": "object", "properties": {
             "mac": {"type": "string", "description": "MAC address, e.g. aa:bb:cc:dd:ee:ff"},
@@ -230,6 +257,7 @@ TOOLS = {
         "fn": tool_update_client,
     },
     "block_client": {
+        **meta("Block client", read_only=False, destructive=True, idempotent=True, open_world=False),
         "description": "Block a registered client by MAC address",
         "inputSchema": {"type": "object", "properties": {
             "mac": {"type": "string", "description": "MAC address to block, e.g. aa:bb:cc:dd:ee:ff"},
@@ -237,6 +265,7 @@ TOOLS = {
         "fn": tool_block_client,
     },
     "unblock_client": {
+        **meta("Unblock client", read_only=False, destructive=True, idempotent=True, open_world=False),
         "description": "Unblock a previously blocked client by MAC address",
         "inputSchema": {"type": "object", "properties": {
             "mac": {"type": "string", "description": "MAC address to unblock, e.g. aa:bb:cc:dd:ee:ff"},
@@ -244,11 +273,13 @@ TOOLS = {
         "fn": tool_unblock_client,
     },
     "get_mesh_nodes": {
+        **meta("List mesh nodes", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Get Mesh Wi-Fi system nodes: controller and extenders with client count, firmware, uptime and connection speed",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_mesh_nodes,
     },
     "get_extender_log": {
+        **meta("Read extender log", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Get system log from mesh extender(s). Extenders are discovered automatically. If extender_ip is not specified, fetches logs from all active extenders.",
         "inputSchema": {"type": "object", "properties": {
             "extender_ip": {"type": "string", "description": "Extender IP address (optional, default: all extenders)"},
@@ -258,16 +289,19 @@ TOOLS = {
         "fn": tool_get_extender_log,
     },
     "reboot": {
+        **meta("Reboot router", read_only=False, destructive=True, idempotent=False, open_world=False),
         "description": "Reboot the router",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_reboot,
     },
     "backup_config": {
+        **meta("Back up router config", read_only=False, destructive=True, idempotent=False, open_world=False),
         "description": "Manually trigger a router config backup right now",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_backup_config,
     },
     "backup_mcp_config": {
+        **meta("Back up MCP config files", read_only=False, destructive=True, idempotent=True, open_world=False),
         "description": (
             "Back up the keenetic-mcp files that git cannot restore (.env, "
             "watch_rules.json, the Entware init script) to the NAS. Refreshes "
@@ -282,11 +316,13 @@ TOOLS = {
         "fn": tool_backup_mcp_config,
     },
     "dump_log": {
+        **meta("Dump router log to NAS", read_only=False, destructive=False, idempotent=False, open_world=False),
         "description": "Snapshot the current router log and rsync it to the NAS backup path (RAM-only staging, no flash writes). Useful to preserve the log before a reboot.",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_dump_log,
     },
     "rci_query": {
+        **meta("Query RCI tree", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": (
             "Raw READ-ONLY query against the router's RCI tree. Performs GET "
             "/rci/show/<path> - it cannot write, because writing requires a POST "
@@ -307,6 +343,7 @@ TOOLS = {
         "fn": tool_rci_query,
     },
     "get_config": {
+        **meta("Read running config", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": (
             "Read the router's running-config with an optional regex filter. "
             "Secrets (md5/nthash/psk/password/private-key) are masked unless "
@@ -325,6 +362,7 @@ TOOLS = {
         "fn": tool_get_config,
     },
     "get_config_state": {
+        **meta("Get config save state", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": (
             "Parsed show/last-change: when the config was last touched (date "
             "given both in MSK and UTC), which agent and user touched it, and "
@@ -338,6 +376,7 @@ TOOLS = {
         "fn": tool_get_config_state,
     },
     "diff_saved_config": {
+        **meta("Diff unsaved config", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": (
             "Diff running-config against startup-config as CLI text (the "
             "/ci/ endpoints, outside /rci/) - a direct, checksum-independent "
@@ -350,41 +389,49 @@ TOOLS = {
         "fn": tool_diff_saved_config,
     },
     "get_port_forwarding": {
+        **meta("List port forwarding", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "List port forwarding / static NAT rules ('ip static') from running-config",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_port_forwarding,
     },
     "get_firewall_rules": {
+        **meta("List firewall rules", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "List firewall rules: access-lists with their entries, ip firewall settings and interface access-groups",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_firewall_rules,
     },
     "get_dhcp_static": {
+        **meta("List static DHCP reservations", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "List static DHCP reservations ('ip dhcp host'). Unlike get_dhcp_leases, which only shows dynamic pool leases, this shows fixed bindings.",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_dhcp_static,
     },
     "get_keendns_mappings": {
+        **meta("List KeenDNS mappings", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "KeenDNS / web-access mappings from running-config ('ip http proxy'). Complements get_web_access, which reads the generated nginx config instead.",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_keendns_mappings,
     },
     "get_media": {
+        **meta("Get storage overview", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Storage overview: internal flash and USB drives with partition UUID, label, filesystem, state, free space and which subsystem uses them (e.g. opkg). Use it to check whether the Entware drive is healthy.",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_media,
     },
     "get_opkg_status": {
+        **meta("Get Entware status", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "Entware/OPKG state: which drive is bound, the initrc path, and whether /opt is actually mounted. If opt_mounted is false, keenetic-mcp itself is running on borrowed time.",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_get_opkg_status,
     },
     "list_backups": {
+        **meta("List backups on NAS", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": "List config backup files already present on the NAS (rsync --list-only). Confirms that scheduled backups actually arrived.",
         "inputSchema": {"type": "object", "properties": {}},
         "fn": tool_list_backups,
     },
     "get_dns_proxy": {
+        **meta("Get DNS proxy status", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": (
             "DNS proxy status: upstream resolvers (with DoT SNI), the static A/AAAA "
             "records the proxy serves (parsed into domain/address), and the 'ip host' "
@@ -395,6 +442,7 @@ TOOLS = {
         "fn": tool_get_dns_proxy,
     },
     "get_schedule": {
+        **meta("List schedules", read_only=True, destructive=False, idempotent=True, open_world=False),
         "description": (
             "List router schedules (e.g. the firmware auto-update window) with name, "
             "weekday/time actions and seconds until the next fire. Answers with an "

@@ -4,6 +4,8 @@ The `GET` routes for clients that cannot speak MCP: Home Assistant's `rest` sens
 
 Besides the MCP protocol (POST `/<MCP_SECRET>`), the server answers a few plain `GET` requests, authenticated by the same secret token in the URL path.
 
+The MCP side supports protocol versions `2025-06-18`, `2025-03-26` and `2024-11-05`. `initialize` answers with the client's version when it is one of these, and with `2025-06-18` otherwise. On every other request an `MCP-Protocol-Version` header outside that list gets **400**; a request without the header is accepted. A notification (a message with no `id`) gets **202** with an empty body. Batches are not supported: a JSON array, like any body that is not a single JSON object, gets 400 with JSON-RPC error `-32600`, and a body that is not JSON at all gets 400 with `-32700`.
+
 ## Calling tools over HTTP
 
 ```

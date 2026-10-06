@@ -2,6 +2,23 @@
 
 Tool counts are stated as `before -> after`. Dates are MSK.
 
+## 2.9.0 — 2026-10-06
+
+Tool annotations, protocol version negotiation, and a transport that answers malformed requests instead of dropping the connection.
+
+### Added
+- Every tool carries a `title` and MCP `annotations` with all four hints set explicitly (`readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint`). Hints describe the worst case of a real call, regardless of `dry_run` — see [tool annotations](docs/tools.md#tool-annotations).
+- `initialize` negotiates the protocol version: `2025-06-18`, `2025-03-26` and `2024-11-05` are echoed back, anything else gets `2025-06-18`. `GET /<MCP_SECRET>` reports `2025-06-18`.
+
+### Changed
+- A POST other than `initialize` with an `MCP-Protocol-Version` header outside the supported list gets HTTP 400 with JSON-RPC error `-32600`. A request without the header is accepted as before.
+- `tests/` with `unittest` tests for the annotations and the transport, and a `tests.yml` GitHub Actions workflow running them on Python 3.13.
+
+### Fixed
+- Notifications, including `notifications/initialized`, get 202 with an empty body instead of a `Method not found` error.
+- An empty, non-JSON or batch body, or one that is not a JSON object, gets HTTP 400 with a JSON-RPC error (`-32700` or `-32600`) instead of a dropped connection. An invalid or negative `Content-Length` is treated as a non-JSON body.
+- `params` that is not an object gets JSON-RPC error `-32602` instead of a dropped connection.
+
 ## 2.8.0 — 2026-09-19
 
 Honest save confirmation and intent verification across the write tools, two new read tools and a repository secret scan — 47 -> 49 tools.
